@@ -1,3 +1,3 @@
 run,measured_frames,measured_total_s,measured_first_png_s,measured_nine_intervals_s,measured_interval_count,projected_frames,projected_total_s,measured_reduction_vs_official_pct,projected_saved_vs_official_s,projected_reduction_vs_official_pct
-official_blender,10,560.246,189.144,371.102,9,1000,41381.466,0.000000,0.000,0.000000
-cycles_frame_pipeline,10,466.027,208.306,257.721,9,1000,28815.337,16.817434,12566.129,30.366563
+official_blender,10,576.072,193.164,382.908,9,1000,42695.952,0.000000,0.000,0.000000
+cycles_frame_pipeline,10,472.271,200.398,271.873,9,1000,30378.301,18.018755,12317.651,28.849693

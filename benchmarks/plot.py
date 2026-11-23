@@ -3,6 +3,7 @@
 import argparse
 import csv
 from decimal import Decimal
+from math import ceil
 from pathlib import Path
 
 import matplotlib
@@ -21,13 +22,13 @@ METRICS = (
     ("launch_to_last_png_s", 600, (0, 200, 400, 600), "s"),
     ("warm_average_png_interval_s", 45, (0, 15, 30, 45), "s"),
     ("warm_card_gpu_pct", 100, (0, 25, 50, 75, 100), "%"),
-    ("warm_card_gpu_below_10_s", 90, (0, 30, 60, 90), "s"),
+    ("warm_card_gpu_below_10_s", 12, (0, 4, 8, 12), "s"),
     ("vram_peak_gib", 16, (0, 4, 8, 12, 16), "GiB"),
     ("system_commit_peak_gib", 100, (0, 25, 50, 75, 100), "GiB"),
 )
 TEXT = {
     "en": {
-        "names": ("Official Blender", "Cycles Frame Pipeline"),
+        "names": ("Official Blender", "v0.5.0 · Host BVH Prepacking"),
         "overview": "Ten consecutive animation frames",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   Frames 624–633",
         "metrics": ("Launch to final PNG", "Mean interval between PNGs", "Mean GPU utilization",
@@ -35,18 +36,18 @@ TEXT = {
         "windows": ("All ten frames", "Nine warm intervals", "Nine warm intervals",
                     "Nine warm intervals", "Launch to process exit", "Launch to process exit"),
         "traces": "GPU and memory over time",
-        "trace_labels": ("GPU utilization", "Dedicated VRAM", "Physical RAM"),
+        "trace_labels": ("GPU utilization", "Dedicated VRAM", "Physical RAM", "System commit"),
         "time": "Seconds since launch",
         "notes": "Each column shows one complete run. Dashed lines mark publication of the first and last PNG.",
         "projection_title": "Time saved across two sequence lengths",
         "projection_sub": "Launch to final PNG on the RX 7800 XT. Percentages use Official Blender's time at the same frame count.",
         "projection_rows": ("10 frames · measured", "1,000 frames · estimated"),
-        "projection_cols": ("Sequence", "Official Blender", "Cycles Frame Pipeline", "Time reduction"),
+        "projection_cols": ("Sequence", "Official Blender", "v0.5.0 default", "Time reduction"),
         "projection_saving": "Estimated saving over 1,000 frames",
         "projection_note": "One measured first frame + 999 intervals at the mean of the nine measured PNG intervals.",
     },
     "zh": {
-        "names": ("官方 Blender", "发布版"),
+        "names": ("官方 Blender", "v0.5.0 · 主机端 BVH 预打包"),
         "overview": "连续十帧动画渲染",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   第 624–633 帧",
         "metrics": ("启动至最后一张 PNG 写完", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
@@ -54,13 +55,13 @@ TEXT = {
         "windows": ("全部十帧", "后九个出图间隔", "后九个出图间隔",
                     "后九个出图间隔", "从启动到进程退出", "从启动到进程退出"),
         "traces": "GPU 与内存使用时间线",
-        "trace_labels": ("GPU 利用率", "专用显存", "物理内存"),
+        "trace_labels": ("GPU 利用率", "专用显存", "物理内存", "系统提交内存"),
         "time": "距启动时间（秒）",
         "notes": "每列对应一组完整测试。两条虚线依次标出首张和末张 PNG 写完的时间。",
         "projection_title": "10 帧实测与 1,000 帧估算的耗时降幅",
         "projection_sub": "RX 7800 XT 单次启动至末张 PNG 写完，耗时降幅以同帧数的官方 Blender 耗时为分母。",
         "projection_rows": ("10 帧 · 实测", "1,000 帧 · 估算"),
-        "projection_cols": ("渲染序列", "官方 Blender", "发布版", "耗时降幅"),
+        "projection_cols": ("渲染序列", "官方 Blender", "v0.5.0 默认设置", "耗时降幅"),
         "projection_saving": "1,000 帧预计节省",
         "projection_note": "实测首帧耗时 + 999 个出图间隔，每个间隔取实测后九帧的平均值。",
     },
@@ -194,11 +195,12 @@ def overview(language, summary):
 
 def telemetry(language, summary, rows):
     words = TEXT[language]
-    fig, axes = plt.subplots(3, len(RUNS), sharex=True, sharey="row", figsize=(13, 8.1))
-    fig.subplots_adjust(left=.083, right=.976, bottom=.14, top=.775, hspace=.31, wspace=.10)
+    fig, axes = plt.subplots(4, len(RUNS), sharex=True, sharey="row", figsize=(13, 9))
+    fig.subplots_adjust(left=.083, right=.976, bottom=.13, top=.79, hspace=.35, wspace=.10)
     heading(fig, words["traces"], words["subtitle"])
     y_metrics = (("gpu_busy_pct", "%", (0, 50, 100)), ("vram_used_gib", "GiB", (0, 8, 16)),
-                 ("ram_used_gib", "GiB", (0, 16, 32)))
+                 ("ram_used_gib", "GiB", (0, 16, 32)), ("commit_gib", "GiB", (0, 40, 80)))
+    end = 150 * ceil(max(float(summary[run]["launch_to_exit_s"]) for run in RUNS) / 150)
     for column, run in enumerate(RUNS):
         series = [r for r in rows if r["run"] == run and
                   0 <= float(r["seconds_from_launch"]) <= float(summary[run]["launch_to_exit_s"])]
@@ -212,8 +214,8 @@ def telemetry(language, summary, rows):
                 ax.axvline(float(summary[run][event]), color=MUTED, lw=.9, dashes=(3, 3), zorder=1)
             ax.set_yticks(ticks)
             ax.set_ylim(-ticks[-1] * .04, ticks[-1] * 1.06)
-            ax.set_xlim(0, 580)
-            ax.set_xticks((0, 150, 300, 450))
+            ax.set_xlim(0, end)
+            ax.set_xticks(range(0, end + 1, 150))
             ax.grid(color=GRID, linewidth=.7)
             if column == 0:
                 ax.set_ylabel(f"{words['trace_labels'][index]}\n({unit})", color=INK, fontsize=10)

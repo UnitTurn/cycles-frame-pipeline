@@ -2,27 +2,31 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Render consecutive Blender animation frames on one GPU. While Cycles samples frame **N**, Blender evaluates frame **N+1** in animation order and a second Cycles session prepares its scene and acceleration structures. At the frame boundary, the prepared session starts sampling without a second scene evaluation. A CPU worker denoises the previous frame and writes its numbered PNG.
+Cycles Frame Pipeline 0.5.0 uses **Host BVH Prepacking** by default. On supported software BVH2 scenes, Blender evaluates frame **N+1** while the GPU samples frame **N**. Cycles validates the next frame’s geometry inputs, packs its BVH on the CPU and keeps the result in system memory. At handoff, the same Cycles session uploads the prepared data and starts sampling. A CPU worker processes the previous frame and writes its PNG.
 
-The Windows release targets AMD HIP and NVIDIA CUDA and OptiX. Published Ruins timing and image comparisons cover the RX 7800 XT on HIP. Both NVIDIA backends completed a separate three-frame regression scene on an RTX 3090. [GPU and Blender compatibility](#gpu-and-blender-compatibility) · [Published Ruins benchmark](benchmarks/README.md)
+The Windows engine includes AMD HIP, NVIDIA CUDA and NVIDIA OptiX. The published Host BVH Prepacking benchmark uses an RX 7800 XT with HIP. [GPU and Blender compatibility](#gpu-and-blender-compatibility) · [Ruins benchmark](benchmarks/README.md)
 
-**1,000-frame estimate on a Radeon RX 7800 XT.** If a 1080p animation sustains the throughput measured on Ruins frames 624–633, the pipeline would save about **3 h 29 min 26 s**. Both percentages use the time from launch to final PNG and the same denominator, the wall time measured for official Blender on the same card. The calculation is `(official time − pipeline time) / official time`.
+<!-- benchmark-projection:begin -->
 
-| Sequence | Official Blender | Cycles Frame Pipeline | Time reduction |
+**Measured on a Radeon RX 7800 XT.** Using Host BVH Prepacking, Ruins frames 624–633 reached the final PNG **103.801 s sooner**. A 1,000-frame animation at the same steady output rate would save about **3 h 25 min 18 s**.
+
+| Sequence | Official Blender | v0.5.0 default | Time saved |
 |---|---:|---:|---:|
-| 10 frames · measured | 560.25 s | 466.03 s | **16.82%** |
-| 1,000 frames · projected | 11 h 29 min 41 s | 8 h 00 min 15 s | **30.37%** |
+| 10 frames · measured | 576.072 s | 472.271 s | **18.02%** |
+| 1,000 frames · projected | 11 h 51 min 36 s | 8 h 26 min 18 s | **28.85%** |
 
-![Measured time reduction across ten frames and projected time reduction across 1,000 frames on the RX 7800 XT](benchmarks/projection-en.png)
+![Measured and projected reductions in time from launch to the final PNG](benchmarks/projection-en.png)
 
-The estimate counts startup once and uses the mean of the nine measured intervals for the remaining frames. The formula is `first PNG + 999 × ((tenth PNG − first PNG) / 9)`. Times are seconds from launch. The input pairs were 189.144 and 560.246 for official Blender, and 208.306 and 466.027 for Cycles Frame Pipeline. Shots with different geometry or sampling costs will have different frame intervals.
+The estimate counts the first frame once and uses the mean of the nine subsequent PNG intervals for the remaining 999 frames. Both percentages use official Blender’s time at the same frame count as the denominator.
 
-[Install](#install) · [Render an animation](#render-an-animation) · [Benchmark and image quality](#benchmark-and-image-quality) · [Build and test](#build-and-test)
+<!-- benchmark-projection:end -->
+
+[Install](#install) · [Render an animation](#render-an-animation) · [Benchmark results](#benchmark-results) · [Build and test](#build-and-test)
 
 ## When to use it
 
-- **Workload.** Consecutive Cycles frames with a measurable gap between one frame's last samples and the next frame's first samples. Geometry, camera, motion blur and material inputs advance in animation order. Two resident device scenes cost extra VRAM and system memory. The first frame still pays for scene loading and setup.
-- **Scene and output.** Use a single enabled view layer, a single view, the Combined pass, PNG output and CPU Open Image Denoise enabled for final rendering on both scene and layer. A compositor using Combined image/alpha can be replayed when its dependencies are supported. Multiple views, active sequencer strips, animated compositor graphs, partial render borders and custom view curves are examples that require the serial path. Prepared mode reports an unsupported setting at submission. [Scene compatibility checks](pipeline/composition.py)
+- **Workload.** Use this mode for consecutive Cycles frames with a gap between GPU sampling windows. It is most effective when BVH work fits inside the preceding frame’s sampling time. Allow system memory for the next packed tree. The GPU holds one active scene, and the first frame pays for loading and initialization.
+- **Scene and output.** Use a single enabled view layer, a single view, the Combined pass, PNG output and CPU Open Image Denoise enabled for final rendering on both scene and layer. A compositor using Combined image/alpha can be replayed when its dependencies are supported. Multiple views, active sequencer strips, animated compositor graphs, partial render borders and custom view curves are examples that require the serial path. Automatic mode can fall back to serial output. Use `--fallback error` to require the requested pipeline. [Scene compatibility checks](pipeline/composition.py)
 
 ## GPU and Blender compatibility
 
@@ -31,17 +35,17 @@ The engine overlay requires the official **Blender 5.2.1 LTS for Windows x64**, 
 | Backend | Tested on hardware | Theoretical coverage on Windows x64 |
 |---|---|---|
 | AMD HIP | Radeon RX 7800 XT, software BVH2 | RDNA 1 and newer. Examples include Radeon RX 5000, 6000, 7000 and 9000. Blender lists Radeon Software 24.9.1 or Radeon PRO Software 24.Q4 as its Windows minimum. |
-| NVIDIA CUDA | GeForce RTX 3090, software BVH2 | Compute capability 5.0 or higher, with a driver able to load the matching Blender CUDA kernel. Examples include GeForce RTX 20, 30, 40 and 50 series. |
-| NVIDIA OptiX | GeForce RTX 3090, native OptiX acceleration structures | Compute capability 5.0 or higher and NVIDIA driver 575 or newer. RTX cards can use their RT cores for ray tracing. |
+| NVIDIA CUDA | RTX 3090 rendering verified in v0.4.0. The software BVH2 path supports host prepacking in 0.5.0 by design. | Compute capability 5.0 or higher with a compatible Blender CUDA kernel and driver. |
+| NVIDIA OptiX | RTX 3090 rendering verified in v0.4.0. OptiX builds its own acceleration structures. | Compute capability 5.0 or higher, NVIDIA driver 575 or newer. RTX GPUs can use their RT cores for ray tracing. |
 
-The theoretical range follows Blender 5.2's device requirements. The official 5.2.1 Windows runtime includes CUDA cubins and a PTX fallback. Its main OptiX PTX kernel targets `sm_50`. For an untested model, the matching official build must be able to render on that backend, and both sessions must fit the available memory. Performance and image comparisons apply to the tested card, backend and workload. This release covers single-GPU operation and omits HIP RT, Intel oneAPI and Apple Metal. [Blender 5.2 GPU requirements](https://docs.blender.org/manual/en/5.2/render/cycles/gpu_rendering.html) · [NVIDIA compute capability by model](https://developer.nvidia.com/cuda/gpus)
+The theoretical range follows the requirements for the pinned Blender 5.2 runtime. The Windows package includes single-GPU HIP, CUDA and OptiX. The published measurements apply to the AMD configuration below. [Blender 5.2 GPU requirements](https://docs.blender.org/manual/en/5.2/render/cycles/gpu_rendering.html) · [NVIDIA compute capability by model](https://developer.nvidia.com/cuda/gpus)
 
-HIP and CUDA validate the software BVH2 inputs before reusing a previous tree and rebuild when those inputs change. OptiX prepares the next frame using its own acceleration structures. All three backends can overlap next-frame preparation and CPU frame output, including CPU Open Image Denoise. Select a GPU backend for path tracing and CPU OIDN for the final denoise.
+HIP and CUDA use native software BVH2 validation and packing when the scene qualifies. OptiX uses its native device build at handoff with the default upload policy. The optional eager upload policy prepares the next device scene in a second session and requires more VRAM.
 
 ## Install
 
 1. Install the official **Blender 5.2.1 LTS Windows x64** build. The installer checks the build hash because the patched executable uses the matching Blender runtime and HIP, CUDA and OptiX kernels.
-2. For the English interface, download `cycles-frame-pipeline-windows-x64-0.4.0-en.zip` (Windows engine overlay and English installer) and `cycles_frame_pipeline-0.4.0-en.zip` (extension) from the [latest release](https://github.com/expitau-one/cycles-frame-pipeline/releases/latest). The Chinese distribution has the same extension ID and engine. Install one language edition. Extract the engine overlay to `.\downloads\engine` for the paths below. From your working directory, run the included English installer in PowerShell. Adjust the official installation path and choose a new destination directory for the side-by-side runtime.
+2. For the English interface, download `cycles-frame-pipeline-windows-x64-0.5.0-en.zip` (Windows engine overlay and English installer) and `cycles_frame_pipeline-0.5.0-en.zip` (extension) from the [latest release](https://github.com/UnitTurn/cycles-frame-pipeline/releases/latest). The Chinese distribution has the same extension ID and engine. Install one language edition. Extract the engine overlay to `.\downloads\engine` for the paths below. From your working directory, run the included English installer in PowerShell. Adjust the official installation path and choose a new destination directory for the side-by-side runtime.
 
    ```powershell
    .\downloads\engine\install_backend.ps1 `
@@ -56,7 +60,7 @@ HIP and CUDA validate the software BVH2 inputs before reusing a previous tree an
    .\backend\open_blender.ps1
    ```
 
-4. **In that window**, open **Edit → Preferences → Get Extensions → menu → Install from Disk**, select `cycles_frame_pipeline-0.4.0-en.zip` and choose the default user repository. Enable **Cycles Frame Pipeline**. Use the same launcher next time. It keeps this edition's preferences and default extensions under `%LOCALAPPDATA%\CyclesFramePipeline\5.2\en_US`. On first launch, it imports the existing startup settings and default user extensions.
+4. **In that window**, open **Edit → Preferences → Get Extensions → menu → Install from Disk**, select `cycles_frame_pipeline-0.5.0-en.zip` and choose the default user repository. Enable **Cycles Frame Pipeline**. Use the same launcher next time. It keeps this edition's preferences and default extensions under `%LOCALAPPDATA%\CyclesFramePipeline\5.2\en_US`. On first launch, it imports the existing startup settings and default user extensions.
 
 **Using your regular Blender profile.** Starting `backend\blender.exe` directly follows your normal Blender language and preferences. To submit from an official Blender installation, install the English extension in that window and set **Custom Blender Executable** to the patched `backend\blender.exe`. The CLI workflow below uses the repository scripts and the backend.
 
@@ -65,45 +69,51 @@ HIP and CUDA validate the software BVH2 inputs before reusing a previous tree an
 
 **Select your GPU.** In the Blender profile used for rendering, open **Edit → Preferences → System → Cycles Render Devices**, choose **HIP**, **CUDA** or **OptiX**, enable the target GPU only and save preferences. In the source scene set **Render Properties → Cycles → Device** to **GPU Compute**. Select **OpenImageDenoise** for final rendering and disable **Use GPU** for that denoise. Save the scene before submitting it from disk.
 
-**Blender UI.** In **Render Properties → Cycles Frame Pipeline**, select the current scene or a saved `.blend`, choose **Use Scene Settings**, set a PNG output directory and choose **Native Cycles Denoising and Output**. Enable **Optimize Native BVH (Custom Engine)**, select **Prepare Next Frame in Parallel**, then click **Start Pipeline Render**. For the 1,000-frame example, set the scene’s frame range to 1–1000 with a step of 1. Progress counts completed PNGs. For a large scene, an empty Blender window can submit a `.blend` from disk.
+**Blender UI.** In **Render Properties → Cycles Frame Pipeline**, select the current scene or a saved `.blend`, choose **Use Scene Settings** and a PNG output directory, then click **Start Pipeline Render**. New configurations default to **Host BVH Prepacking**. Set the scene frame range to 1–1000 and step to 1 for the example. For large scenes, submit the saved file from an empty Blender window.
 
 **Command line.** From the repository root, replace `.\scene.blend` with your scene. This example uses the scene's saved render settings and writes `0001.png` through `1000.png`. The background process reads the device preferences for the Blender profile it starts with.
 
 ```powershell
 & .\backend\blender.exe -b '.\scene.blend' --python-exit-code 9 -P .\pipeline\render.py -- `
     --output '.\renders' --start 1 --end 1000 --step 1 `
-    --profile scene --mode native --bvh-input prepared --post-threads 6
+    --post-threads 6
 ```
 
 | Option | Use |
 |---|---|
-| `--bvh-input prepared` | Opt in to two sessions. One samples while the other prepares the next production frame. Requires `--mode native`. |
+| `--host-bvh-prepacking` | Explicitly select the default native preparation mode. `--defer-upload` is an alias. |
+| `--eager-upload` | Prepare and upload the next frame in a second Cycles session while the current frame is sampling. |
 | `--profile scene` / `ruins-hip256` | Use saved scene settings for HIP, CUDA or OptiX. The optional Ruins preset explicitly selects the RX 7800 XT on HIP, up to 256 samples and a 0.01 adaptive threshold. |
 | `--existing error` / `skip` / `replace` | Stop at an existing PNG (default), skip it, or overwrite it. |
 
-## Benchmark and image quality
+Early packing requires a single background render tile. Per-batch pixel jitter, textures with on-demand tile loading, and geometry that needs GPU displacement use the corresponding native update at handoff. The log records `host_bvh_ready` when the packed data is ready in system memory and `bvh_pack_consumed` when the next frame consumes it. OptiX uses its backend-specific acceleration structures.
 
-**AMD HIP.** The recorded Ruins benchmark used frames 624–633 in order, 1920×1080, RX 7800 XT, standard HIP, persistent data, up to 256 adaptive samples, threshold 0.01 and six CPU OIDN threads. Official Blender and the pipeline each rendered these ten frames once.
+<!-- benchmark-measurements:begin -->
 
-![Measured performance, GPU utilization and peak GPU memory for the ten-frame run](benchmarks/overview-en.png)
+<a id="benchmark-and-image-quality"></a>
 
-| Metric | Official Blender | Cycles Frame Pipeline |
+## Benchmark results
+
+On a Radeon RX 7800 XT, official Blender and the default v0.5.0 configuration each rendered Ruins frames 624–633 in order at 1920 × 1080 with HIP, persistent data and up to 256 adaptive samples at a 0.01 threshold.
+
+| Measurement | Official Blender | v0.5.0 default |
 |---|---:|---:|
-| Launch to first PNG | 189.14 s | 208.31 s |
-| Launch to final PNG | 560.25 s | **466.03 s** |
-| Mean interval between subsequent PNGs | 41.23 s | **28.64 s** |
-| Mean GPU utilization after first PNG | 69.91% | **94.85%** |
-| Time below 10% GPU utilization after first PNG | 81.82 s | **3.00 s** |
-| Peak dedicated GPU memory | 8.62 GiB | **12.29 GiB** |
-| Peak system committed memory | 73.10 GiB | **85.21 GiB** |
+| Launch to first PNG | 193.164 s | 200.398 s |
+| Launch to final PNG | 576.072 s | **472.271 s** |
+| Mean interval between PNGs | 42.545 s | **30.208 s** |
+| Mean GPU utilization between first and last PNG | 71.39% | 91.52% |
+| Time below 10% GPU utilization in that window | 3.007 s | 10.267 s |
+| Peak dedicated VRAM | 8.53 GiB | 8.46 GiB |
+| Peak physical RAM in use | 31.95 GiB | 31.95 GiB |
+| Peak system commit | 73.89 GiB | 76.31 GiB |
 
-The pipeline saved **94.22 s (16.82%)** over stock Blender from launch to the final PNG. At all nine frame transitions, preparation finished before the GPU completed its last sampling batch on the active frame. The median gap between successive sampling windows was **0.139 s**. GPU activity is whole-card utilization sampled at about 1 Hz. System commit includes memory backed by RAM or the Windows page file. Peak physical memory was 31.95 GiB in both runs.
+![Timing, GPU activity and memory for ten consecutive Ruins frames](benchmarks/overview-en.png)
 
-**Image comparison.** Across ten decoded PNG pairs, 5,343 of 20,736,000 pixels differed from stock Blender by one 8-bit RGB level. All other RGB values and all alpha values matched. The two sessions inherit the same cached environment-light sampling distribution and update it when the world changes. A separate four-frame test of the release executable changed world intensity in frame 3. All four RGBA outputs matched stock pixel for pixel.
+At all nine handoffs, Cycles finished packing the next frame’s BVH in system memory while the GPU sampled the preceding frame. The median gap between GPU sampling windows was **1.472 s**. The complete report includes one-second traces, per-frame timestamps and the 1,000-frame calculation. [Measurements and method](benchmarks/README.md)
 
-The AMD figures above come from the recorded ten-frame HIP run. A separate three-frame test of the Windows multi-backend executable on the RX 7800 XT matched the official RGBA output pixel for pixel. The production scene is private. The repository provides the measurements, a chart-generation script and a procedural image test. [AMD benchmark data, time series and methodology](benchmarks/README.md)
+<!-- benchmark-measurements:end -->
 
-**NVIDIA CUDA and OptiX.** On the RTX 3090, both backends completed the three-frame regression scene with overlapping frame preparation and CPU postprocessing. Decoded PNGs were compared with the corresponding official backend. On the original Ruins scene, official CUDA completed the full sequence and CUDA prepared mode produced several frames before reaching the Windows system commit limit. For scenes this large, both GPU memory and the host's combined RAM and page-file capacity matter. The public timing and throughput figures above apply to the RX 7800 XT.
+**NVIDIA CUDA and OptiX.** Earlier RTX 3090 tests completed a three-frame animation on both backends. The benchmark for the new default uses the RX 7800 XT.
 
 ## Build and test
 

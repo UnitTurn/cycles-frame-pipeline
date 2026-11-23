@@ -1,0 +1,69 @@
+diff --git a/intern/cycles/blender/session.h b/intern/cycles/blender/session.h
+--- a/intern/cycles/blender/session.h
++++ b/intern/cycles/blender/session.h
+@@ -68,7 +68,7 @@
+
+   static string formal_begin(int frame, const string &capture);
+   static string formal_collect(int frame);
+-  static void formal_end();
++  static void formal_end(bool resume_native = false);
+
+   void bake(blender::Depsgraph &b_depsgraph_,
+             blender::Object &b_object,
+diff --git a/intern/cycles/blender/session.cpp b/intern/cycles/blender/session.cpp
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -98,7 +98,7 @@
+   return ok ? "" : string_printf("Cycles failed to complete formal frame %d", frame);
+ }
+
+-void BlenderSession::formal_end()
++void BlenderSession::formal_end(const bool resume_native)
+ {
+   if (!formal_batch.request) {
+     return;
+@@ -115,8 +115,17 @@
+     }
+     owner->other_sync_.reset();
+     owner->other_session_.reset();
+-    owner->free_session();
+-    owner->scene = nullptr;
++    if (resume_native && formal_batch.defer_upload && formal_batch.frames.empty() &&
++        formal_batch.submitted && owner->session)
++    {
++      /* The following native render must inherit the same persistent scene (including the
++       * world's existing sampling distribution). All submitted raw films have been collected. */
++      owner->session->set_formal_frame(nullptr);
++    }
++    else {
++      owner->free_session();
++      owner->scene = nullptr;
++    }
+     owner->formal_request_.reset();
+   }
+   formal_batch = {};
+diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -555,6 +555,14 @@
+     PyErr_SetString(PyExc_RuntimeError, error.c_str());
+     return nullptr;
+   }
++  Py_RETURN_NONE;
++}
++
++static PyObject *formal_resume_native_func(PyObject * /*self*/, PyObject * /*args*/)
++{
++  Py_BEGIN_ALLOW_THREADS
++  BlenderSession::formal_end(true);
++  Py_END_ALLOW_THREADS
+   Py_RETURN_NONE;
+ }
+
+@@ -905,5 +913,6 @@
+     {"formal_begin", formal_begin_func, METH_VARARGS, ""},
+     {"formal_collect", formal_collect_func, METH_VARARGS, ""},
+     {"formal_end", formal_end_func, METH_NOARGS, ""},
++    {"formal_resume_native", formal_resume_native_func, METH_NOARGS, ""},
+     {"native_frame_done", native_frame_done_func, METH_NOARGS, ""},
+     {"merge", (PyCFunction)merge_func, METH_VARARGS | METH_KEYWORDS, ""},

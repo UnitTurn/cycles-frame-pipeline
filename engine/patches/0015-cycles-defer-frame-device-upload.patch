@@ -1,0 +1,147 @@
+diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -951,6 +951,7 @@
+ {
+   PyObject *mod = PyModule_Create(&ccl::module);
+   PyModule_AddObjectRef(mod, "with_bvh_lookahead", Py_True);
++  PyModule_AddObjectRef(mod, "with_deferred_upload", Py_True);
+   PyModule_AddObjectRef(mod, "with_native_frame_post", Py_True);
+   PyModule_AddObjectRef(mod, "with_exact_bvh", Py_True);
+
+diff --git a/intern/cycles/blender/session.cpp b/intern/cycles/blender/session.cpp
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -4,6 +4,9 @@
+
+ #include <cstdlib>
+ #include <map>
++#include <unordered_set>
++
++#include "BKE_mesh.hh"
+
+ #include "BLI_path_utils.hh"
+ #include "DEG_depsgraph_query.hh"
+@@ -55,6 +58,7 @@
+   std::shared_ptr<FormalFrame> request;
+   std::map<int, std::shared_ptr<FormalFrame>> frames;
+   bool submitted = false;
++  bool defer_upload = false;
+ } formal_batch;
+
+ string BlenderSession::formal_begin(const int frame, const string &capture)
+@@ -63,6 +67,12 @@
+       (formal_batch.request && !formal_batch.submitted)) {
+     return "Invalid formal frame or previous render was not submitted";
+   }
++  const char *value = blender::BLI_getenv("CYCLES_FRAMEPIPE_DEFER_UPLOAD");
++  const bool defer_upload = value && string_view(value) == "1";
++  if (formal_batch.request && formal_batch.defer_upload != defer_upload) {
++    return "Cannot change device upload timing within a formal frame sequence";
++  }
++  formal_batch.defer_upload = defer_upload;
+   auto next = std::make_shared<FormalFrame>(frame, capture, formal_batch.request);
+   formal_batch.frames.emplace(frame, next);
+   formal_batch.request = std::move(next);
+@@ -233,8 +243,48 @@
+   }
+ }
+
++/* The render depsgraph owns these evaluated meshes. Prime the same lazy host caches queried
++ * by the Cycles exporter, without writing to the current Cycles scene or touching its device. */
++static void warm_deferred_mesh_inputs(blender::Depsgraph &depsgraph)
++{
++  blender::DEGIDIterData iter{};
++  iter.graph = &depsgraph;
++  iter.only_updated = true;
++  std::unordered_set<const blender::Mesh *> visited;
++  ITER_BEGIN (blender::DEG_iterator_ids_begin,
++              blender::DEG_iterator_ids_next,
++              blender::DEG_iterator_ids_end,
++              &iter,
++              blender::ID *,
++              id)
++  {
++    if (GS(id->name) != blender::ID_OB) {
++      continue;
++    }
++    const blender::Object *object = blender::id_cast<blender::Object *>(id);
++    if (object->type != blender::OB_MESH || !object->data ||
++        ((id->recalc | object->data->recalc) & blender::ID_RECALC_GEOMETRY) == 0 ||
++        GS(object->data->name) != blender::ID_ME) {
++      continue;
++    }
++    const blender::Mesh *mesh = blender::id_cast<blender::Mesh *>(object->data);
++    if (mesh->faces_num == 0 || !visited.insert(mesh).second) {
++      continue;
++    }
++    mesh->corner_tris();
++    if (mesh->normals_domain() == blender::bke::MeshNormalDomain::Corner) {
++      mesh->corner_normals();
++    }
++    else {
++      mesh->vert_normals();
++    }
++  }
++  ITER_END;
++}
++
+ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_depsgraph)
+ {
++  bool host_recalc_done = false;
+   if (formal_batch.request && !b_v3d && background) {
+     if (formal_batch.owner && formal_batch.owner != this) {
+       RE_engine_report(&b_engine, 1 << 5, "Formal rendering requires one persistent render engine");
+@@ -242,7 +292,30 @@
+     }
+     formal_batch.owner = this;
+     if (formal_request_ != formal_batch.request) {
+-      if (formal_request_) {
++      if (formal_batch.defer_upload) {
++        const auto &next = formal_batch.request;
++        next->capture.session.store(session.get());
++        next->mark("depsgraph_ready");
++        if (formal_request_) {
++          /* The preceding renderer reads the existing Cycles nodes, image textures, device
++           * buffers and BVH. Restrict overlap to Blender-owned inputs and sync invalidations.
++           * sync_recalc only collects dirty IDs; sync_data consumes them after handoff. */
++          sync->reset(b_data, *DEG_get_evaluated_scene(&b_depsgraph));
++          sync->sync_recalc(b_depsgraph, b_screen, b_v3d, b_rv3d);
++          warm_deferred_mesh_inputs(b_depsgraph);
++          host_recalc_done = true;
++          next->mark("host_recalc_ready");
++          if (!formal_request_->wait_for_finish()) {
++            RE_engine_report(&b_engine, 1 << 5, "Previous deferred frame did not finish");
++            return;
++          }
++          session->wait();
++        }
++        /* Includes all memory-producing paths, including builtin image loading inside
++         * BlenderSession::render, and device initialization on the first frame. */
++        next->mark("deferred_upload_begin");
++      }
++      else if (formal_request_) {
+         session.swap(other_session_);
+         sync.swap(other_sync_);
+         if (session) {
+@@ -327,7 +400,7 @@
+     sync = make_unique<BlenderSync>(
+         b_engine, b_data, *b_scene, scene, !background, use_developer_ui, session->progress);
+   }
+-  else {
++  else if (!host_recalc_done) {
+     /* Sync recalculations to do just the required updates. */
+     sync->sync_recalc(b_depsgraph, b_screen, b_v3d, b_rv3d);
+   }
+@@ -610,6 +683,11 @@
+         if (!check_and_report_session_error()) {
+           RE_engine_report(&b_engine, 1 << 5, "Formal frame could not reach its sampling boundary");
+         }
++      }
++      else if (formal_batch.defer_upload) {
++        /* Keep the one persistent Session. Submit the next Blender frame once GPU work on
++         * this one has started; its render graph can then be evaluated concurrently. */
++        formal_request_->wait_for_sampling();
+       }
+       else if (!other_session_ && blender::BLI_getenv("CYCLES_FRAMEPIPE_LAST") &&
+                string(blender::BLI_getenv("CYCLES_FRAMEPIPE_LAST")) != "1" &&

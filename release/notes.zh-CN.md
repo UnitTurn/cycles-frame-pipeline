@@ -1,16 +1,36 @@
-# Cycles 帧间流水线 0.4.0
+# Cycles 帧间流水线 v0.5.0 — 主机端 BVH 预打包
 
-[English release notes](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/release/notes.md)
+[English release notes](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/release/notes.md)
 
-Windows x64 引擎现在提供 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。CUDA 沿用软件 BVH2 的校验和复用逻辑。OptiX 在准备下一帧的会话中构建原生加速结构。满足场景条件时，三个后端都可以在 GPU 采样时，用 CPU 为已完成的帧执行 Open Image Denoise 并输出 PNG。
+GPU 为当前帧采样时，Blender 按动画顺序求值下一帧。在符合条件的 HIP 和 CUDA 场景中，Cycles 提前在 CPU 上校验并打包下一帧用于光线追踪的软件 BVH2。前一帧释放 GPU 后，Cycles 直接上传打包结果并开始采样。Ruins 动画的九次切帧均直接使用了各自预先打好的 BVH，每份使用一次。前帧结束采样到后帧开始采样的中位间隔为 **1.47 秒**。
 
-请使用官方 Windows x64 Blender 5.2.1 LTS（提交 `9e2066aef7ef`），下载同一种语言的扩展和引擎包。在 Cycles 偏好设置中选择后端并勾选显卡，渲染设备选择 GPU 计算，插件配置选择沿用场景设置。
+## Radeon RX 7800 XT 实测
 
-| 下载 | 简体中文 | English |
+Ruins 工程使用单张 RX 7800 XT，以 HIP 连续渲染第 624–633 帧。分辨率为 1920 × 1080，开启持久数据，最高 256 个自适应采样，噪声阈值为 0.01。每种配置完整运行一次，出图耗时从进程启动开始计算。
+
+| 指标 | 官方 Blender 5.2.1 LTS | v0.5.0 主机端预打包 |
+|---|---:|---:|
+| 首张 PNG 耗时 | 193.16 秒 | 200.40 秒 |
+| 第十张 PNG 耗时 | 576.07 秒 | **472.27 秒** |
+| 首张之后九个出图间隔的均值 | 42.55 秒 | 30.21 秒 |
+| 上述九个间隔的整卡平均 GPU 利用率 | 71.39% | 91.52% |
+| 整卡专用显存峰值 | 8.53 GiB | 8.46 GiB |
+| Windows 整机提交内存峰值 | 73.89 GiB | 76.31 GiB |
+| 第 1,000 张 PNG 耗时（推算） | 11 小时 51 分 36 秒 | **8 小时 26 分 18 秒** |
+
+实测十帧节省 **103.80 秒（18.02%）**。按首帧启动一次、随后 999 个出图间隔沿用本次九个间隔的均值推算，1,000 帧可节省 **3 小时 25 分 18 秒（28.85%）**。计时使用发布候选引擎。最终包还处理了动画中途变更 UV 或运动通道、回退至串行输出两种情况。Ruins 的通道设置固定，十帧均走预打包路径。[基准数据与图表](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/benchmarks/README.zh-CN.md)
+
+## 安装与使用
+
+安装官方 **Blender 5.2.1 LTS Windows x64**，构建提交号为 `9e2066aef7ef`。选择同一语言的 Blender 扩展和 Windows 引擎覆盖包。覆盖包中的安装脚本会从该版本的官方 Blender 获取运行库和 GPU 内核。[安装指南](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.zh-CN.md#安装)
+
+| 下载项 | 简体中文 | English |
 |---|---|---|
-| Blender 扩展 | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-zh-CN.zip) | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-en.zip) |
-| Windows x64 引擎 | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-zh-CN.zip) | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-en.zip) |
+| Blender 扩展 | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-zh-CN.zip) | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-en.zip) |
+| Windows x64 引擎覆盖包 | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-zh-CN.zip) | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-en.zip) |
 
-已实机验证 RX 7800 XT 的 HIP，以及 RTX 3090 的 CUDA 和 OptiX。两种 NVIDIA 后端均在回归场景中连续出图。在较大的 Ruins 工程中，CUDA 开启两项优化后输出了部分帧，随后触及 Windows 系统提交内存上限。该卡的 Ruins 优化版完整序列尚待验证。准备双帧时需同时留出显存和系统提交内存。
+命令行原生模式默认在符合条件的场景中启用主机端 BVH 预打包。加上 `--eager-upload` 可使用第二个 GPU 会话，提前上传下一帧。在面板中取消勾选「主机端 BVH 预打包」也可切换到提前上传。[渲染方法](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.zh-CN.md#渲染动画) · [项目源码 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-source-0.5.0.zip)
 
-[安装和理论支持范围](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/README.zh-CN.md#显卡与-blender-兼容范围) · [项目源码 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-source-0.4.0.zip)
+## 显卡支持范围
+
+上表为 AMD HIP 与软件 BVH2 在生产工程上的实测。引擎的 CUDA 后端也支持此次新增的软件 BVH2 预打包。OptiX 使用 NVIDIA 原生加速结构，由所选 GPU 会话构建。此前已在 RTX 3090 上分别用 CUDA 和 OptiX 跑通连续三帧动画。v0.5.0 在 NVIDIA 上的生产工程耗时仍待实测。[显卡与 Blender 兼容范围](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.zh-CN.md#显卡与-blender-兼容范围)

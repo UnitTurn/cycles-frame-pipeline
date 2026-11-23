@@ -11,7 +11,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 BLENDER_REVISION = "9e2066aef7ef7e20c142ad7bd3303138a4304c93"
-REPOSITORY = "https://github.com/expitau-one/cycles-frame-pipeline"
+REPOSITORY = "https://github.com/UnitTurn/cycles-frame-pipeline"
 
 
 def release_executable(path):
@@ -22,8 +22,8 @@ def release_executable(path):
             struct.unpack_from("<H", image, coff+4)[0] != 0x8664 or
             struct.unpack_from("<H", image, opt)[0] != 0x20B):
         raise ValueError("Expected a Windows x64 PE32+ executable")
-    if b"formal_begin\0" not in image or b"with_native_frame_post\0" not in image:
-        raise ValueError("Missing the prepared-frame Cycles extension")
+    if b"with_host_bvh_packing\0" not in image or b"formal_resume_native\0" not in image:
+        raise ValueError("Missing Host BVH Prepacking or native frame output support")
     directories = opt + 112
     if (struct.unpack_from("<I", image, opt+64)[0] or
             struct.unpack_from("<II", image, directories+32) != (0, 0)):
@@ -78,6 +78,8 @@ def instructions(version, language):
 
 在「编辑 → 偏好设置 → 系统」选择 HIP、CUDA 或 OptiX 并勾选对应 GPU，在 Cycles 渲染属性中选择 GPU 计算。插件的「使用场景设置」可保留此选择。
 
+原生流水线默认使用「主机端 BVH 预打包」。命令行可用 `--eager-upload` 选择提前上传。
+
 启动器首次运行时复制现有 Blender 启动文件、偏好与默认用户扩展到 `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\zh_HANS`。以后的启动会继续使用这个中文配置。直接运行 `backend\\blender.exe` 使用常规 Blender 配置。从官方 Blender 提交作业时，可在插件偏好设置中将「定制 Blender 程序」指向新建的 `backend\\blender.exe`。
 
 [中文说明与构建步骤]({tag}/README.zh-CN.md) · [本版本完整工程源码及补丁]({tag}) · [对应 Blender 上游源码]({upstream})
@@ -93,6 +95,8 @@ Install official Blender 5.2.1 LTS (build `9e2066aef7ef`). Extract this archive,
 Run `.\\backend\\open_blender.ps1` to launch Blender in English. Download `{extension}` from the [matching release]({release}). Choose **Edit → Preferences → Get Extensions → menu → Install from Disk**, install into the default user repository and enable the extension.
 
 In **Edit → Preferences → System**, select HIP, CUDA or OptiX and enable the GPU. Select **GPU Compute** in Cycles Render Properties and **Use Scene Settings** in the extension.
+
+The native pipeline defaults to Host BVH Prepacking. Use `--eager-upload` on the command line to select eager upload.
 
 On first launch, the launcher copies your existing Blender startup file, preferences and default user extension repositories to `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\en_US`. Future launches reuse this English profile. Starting `backend\\blender.exe` directly uses the regular Blender profile. To submit jobs from official Blender, point the extension's custom Blender executable preference to the new `backend\\blender.exe`.
 

@@ -66,8 +66,8 @@ def main():
         finally:
             bpy.data.images.remove(image)
         raw.unlink()
-        (working / f"{frame}.done").touch()
         print(f"PIPELINE_FRAME_DONE {frame}", flush=True)
+        (working / f"{frame}.done").touch()
 
 
 if __name__ == "__main__":

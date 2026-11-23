@@ -31,7 +31,13 @@ def arguments(argv):
     p.add_argument("--mode", choices=["native", "serial", "compositor"], default="native",
                    help="native async, native inline, or the older compositor denoiser")
     p.add_argument("--bvh-input", choices=["off", "auto", "next", "previous", "prepared"],
-                   help="enable the specified native BVH mode, or turn it off; auto selects by render profile")
+                   help="native output defaults to prepared frames with Host BVH Prepacking")
+    upload = p.add_mutually_exclusive_group()
+    upload.add_argument("--host-bvh-prepacking", "--defer-upload", dest="defer_upload",
+                        action="store_true", default=None,
+                        help="pack supported native BVH2 scenes on the CPU and upload at frame handoff (default for prepared frames)")
+    upload.add_argument("--eager-upload", dest="defer_upload", action="store_false",
+                        help="prepare and upload the next frame in a second Cycles session")
     p.add_argument("--stop-file", type=Path)
     p.add_argument("--exr-codec", choices=["NONE", "ZIP", "PIZ"], default="NONE",
                    help="lossless intermediate; NONE minimizes producer CPU work on a local drive")
@@ -39,14 +45,26 @@ def arguments(argv):
     p.add_argument("--fallback", choices=["serial", "error"], default="serial")
     p.add_argument("--existing", choices=["error", "skip", "replace"], default="error")
     args = p.parse_args(argv)
-    args.lookahead = (args.bvh_input != "off" if args.bvh_input is not None
-                      else os.environ.get("CYCLES_BVH_LOOKAHEAD") == "1")
-    if args.bvh_input in (None, "auto"):
-        args.bvh_input = "previous" if args.profile == "ruins-hip256" else "next"
+    upload_requested = args.defer_upload is not None
+    if args.bvh_input is None:
+        env = os.environ.get("CYCLES_BVH_LOOKAHEAD")
+        enabled = upload_requested or (env == "1" if env is not None else args.mode == "native")
+        args.bvh_input = "auto" if enabled else "off"
+    args.lookahead = args.bvh_input != "off"
+    args.auto_prepared = args.bvh_input == "auto" and args.mode == "native" and not upload_requested
+    if args.bvh_input == "auto":
+        if args.mode == "native":
+            args.bvh_input = "prepared"
+        else:
+            args.bvh_input = "previous" if args.profile == "ruins-hip256" else "next"
     if (args.step is not None and args.step < 1) or args.post_threads < 1:
         p.error("--step and --post-threads must be positive")
     if args.bvh_input == "prepared" and args.mode != "native":
         p.error("prepared frames require native frame capture")
+    if upload_requested and args.bvh_input != "prepared":
+        p.error("GPU upload timing requires native output and prepared frames")
+    if not upload_requested:
+        args.defer_upload = args.bvh_input == "prepared"
     return args
 
 
@@ -170,10 +188,11 @@ def run_job(scene, args, frames, working, bvh_inputs=None):
             layer = qualify(scene)
             graph = save_graph(scene, layer, working / "graph.blend") if static_tree or not native else None
         except Unsupported as exc:
-            if args.fallback == "error" or prepared:
+            if args.fallback == "error" or (prepared and not args.auto_prepared):
                 raise
             print(f"PIPELINE_MODE serial ({exc})", flush=True)
             layer = None
+            prepared = False
     child = None
     if layer:
         profile = {"graph": graph, "native_use_compositor": bool(static_tree)}
@@ -229,9 +248,16 @@ def run_job(scene, args, frames, working, bvh_inputs=None):
                         name = save_graph(scene, layer, working / f"{frame}.blend") if tree else None
                         graph_override["frame_graph"] = name
                 except Unsupported as exc:
-                    if args.fallback == "error" or prepared:
+                    if args.fallback == "error" or (prepared and not args.auto_prepared):
                         raise
-                    print(f"PIPELINE_MODE frame {frame} serial ({exc})", flush=True)
+                    if prepared:
+                        if pending:
+                            collect_prepared(working, pending["frame"])
+                            ack = send_post(child, working, ack, pending)
+                            pending = None
+                        _cycles.formal_resume_native()
+                        prepared = False
+                    print(f"PIPELINE_MODE serial frame {frame} ({exc})", flush=True)
                     frame_layer = None
             cfg = settings(scene) if frame_layer else None
             if prepared:
@@ -254,6 +280,9 @@ def run_job(scene, args, frames, working, bvh_inputs=None):
                 else:
                     ack = send_post(child, working, ack, payload)
             else:
+                if ack:
+                    wait_finished(child, ack)
+                    ack = None
                 os.replace(path, out)
                 print(f"PIPELINE_FRAME_DONE {frame}", flush=True)
             if bvh_inputs is not None:
@@ -284,7 +313,19 @@ def run(argv=None):
     lookahead = args.lookahead
     if lookahead:
         import _cycles
-        if not getattr(_cycles, "with_exact_bvh", False):
+        host_packing = getattr(_cycles, "with_host_bvh_packing", False)
+        if args.auto_prepared:
+            host_packing = host_packing and hasattr(_cycles, "formal_resume_native")
+        if args.defer_upload and not host_packing:
+            if args.auto_prepared and args.fallback == "serial":
+                print("PIPELINE_MODE serial (Host BVH Prepacking requires the v0.5 project engine)", flush=True)
+                lookahead = args.lookahead = args.defer_upload = False
+                args.bvh_input = "off"
+                args.mode = "serial"
+            else:
+                print("PIPELINE_DEFER_UPLOAD_UNSUPPORTED", flush=True)
+                raise RuntimeError("Host BVH Prepacking requires the v0.5 Cycles Frame Pipeline engine")
+        if lookahead and not getattr(_cycles, "with_exact_bvh", False):
             raise RuntimeError("Exact BVH lookahead requires the 0.2 or newer project backend")
         if args.bvh_input == "prepared" and not hasattr(_cycles, "formal_begin"):
             raise RuntimeError("This Blender backend does not support prepared frames")
@@ -307,12 +348,17 @@ def run_scene(scene, args, lookahead):
     original_sub = scene.frame_subframe
     env_keys = ("CYCLES_BVH_LOOKAHEAD", "CYCLES_FRAMEPIPE_CAPTURE", "CYCLES_FRAMEPIPE_NEXT", "CYCLES_FRAMEPIPE_LAST",
                 "CYCLES_FRAMEPIPE_EXACT", "CYCLES_FRAMEPIPE_EXACT_REUSE",
-                "CYCLES_FRAMEPIPE_CACHE_DIR", "CYCLES_FRAMEPIPE_HIP_BLAS")
+                "CYCLES_FRAMEPIPE_CACHE_DIR", "CYCLES_FRAMEPIPE_HIP_BLAS", "CYCLES_FRAMEPIPE_DEFER_UPLOAD")
     original_env = {key: os.environ.get(key) for key in env_keys}
     with output_lock(args.output):
         working = Path(tempfile.mkdtemp(prefix=".cycles-stage-", dir=args.output))
         try:
             os.environ["CYCLES_BVH_LOOKAHEAD"] = "1" if lookahead else "0"
+            os.environ["CYCLES_FRAMEPIPE_DEFER_UPLOAD"] = "1" if args.defer_upload else "0"
+            if args.defer_upload:
+                print("PIPELINE_UPLOAD Host BVH Prepacking (upload at frame handoff)", flush=True)
+            elif args.bvh_input == "prepared":
+                print("PIPELINE_UPLOAD eager (second Cycles session)", flush=True)
             bvh_inputs = None
             if args.mode != "compositor" or lookahead:
                 os.environ["CYCLES_FRAMEPIPE_HIP_BLAS"] = "0"

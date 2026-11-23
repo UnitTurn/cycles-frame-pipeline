@@ -1,0 +1,837 @@
+diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -952,6 +952,7 @@
+   PyObject *mod = PyModule_Create(&ccl::module);
+   PyModule_AddObjectRef(mod, "with_bvh_lookahead", Py_True);
+   PyModule_AddObjectRef(mod, "with_deferred_upload", Py_True);
++  PyModule_AddObjectRef(mod, "with_host_bvh_packing", Py_True);
+   PyModule_AddObjectRef(mod, "with_native_frame_post", Py_True);
+   PyModule_AddObjectRef(mod, "with_exact_bvh", Py_True);
+
+diff --git a/intern/cycles/blender/session.cpp b/intern/cycles/blender/session.cpp
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -21,6 +21,7 @@
+ #include "scene/bake.h"
+ #include "scene/camera.h"
+ #include "scene/film.h"
++#include "scene/geometry.h"
+ #include "scene/integrator.h"
+ #include "scene/light.h"
+ #include "scene/mesh.h"
+@@ -56,6 +57,7 @@
+ static struct {
+   BlenderSession *owner = nullptr;
+   std::shared_ptr<FormalFrame> request;
++  std::shared_ptr<FormalFrame> uploading_after;
+   std::map<int, std::shared_ptr<FormalFrame>> frames;
+   bool submitted = false;
+   bool defer_upload = false;
+@@ -74,6 +76,7 @@
+   }
+   formal_batch.defer_upload = defer_upload;
+   auto next = std::make_shared<FormalFrame>(frame, capture, formal_batch.request);
++  next->defer_upload = defer_upload;
+   formal_batch.frames.emplace(frame, next);
+   formal_batch.request = std::move(next);
+   formal_batch.submitted = false;
+@@ -282,6 +285,18 @@
+   ITER_END;
+ }
+
++static bool finish_deferred_predecessor(Session &session, blender::RenderEngine &engine)
++{
++  auto predecessor = std::move(formal_batch.uploading_after);
++  if (!predecessor->wait_for_finish()) {
++    RE_engine_report(&engine, 1 << 5, "Previous deferred frame did not finish");
++    return false;
++  }
++  session.wait();
++  formal_batch.request->mark("deferred_upload_begin");
++  return true;
++}
++
+ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_depsgraph)
+ {
+   bool host_recalc_done = false;
+@@ -297,23 +312,21 @@
+         next->capture.session.store(session.get());
+         next->mark("depsgraph_ready");
+         if (formal_request_) {
+-          /* The preceding renderer reads the existing Cycles nodes, image textures, device
+-           * buffers and BVH. Restrict overlap to Blender-owned inputs and sync invalidations.
+-           * sync_recalc only collects dirty IDs; sync_data consumes them after handoff. */
+           sync->reset(b_data, *DEG_get_evaluated_scene(&b_depsgraph));
+           sync->sync_recalc(b_depsgraph, b_screen, b_v3d, b_rv3d);
+-          warm_deferred_mesh_inputs(b_depsgraph);
+           host_recalc_done = true;
+           next->mark("host_recalc_ready");
+-          if (!formal_request_->wait_for_finish()) {
+-            RE_engine_report(&b_engine, 1 << 5, "Previous deferred frame did not finish");
+-            return;
++          formal_batch.uploading_after = formal_request_;
++          if (!formal_request_->host_scene_available) {
++            warm_deferred_mesh_inputs(b_depsgraph);
++            if (!finish_deferred_predecessor(*session, b_engine)) {
++              return;
++            }
+           }
+-          session->wait();
+         }
+-        /* Includes all memory-producing paths, including builtin image loading inside
+-         * BlenderSession::render, and device initialization on the first frame. */
+-        next->mark("deferred_upload_begin");
++        else {
++          next->mark("deferred_upload_begin");
++        }
+       }
+       else if (formal_request_) {
+         session.swap(other_session_);
+@@ -382,18 +395,19 @@
+      * them rather than trying to distinguish which settings need to be updated
+      */
+     if (!is_new_session) {
++      if (formal_batch.uploading_after && !finish_deferred_predecessor(*session, b_engine)) {
++        return;
++      }
+       free_session();
+       create_session();
+     }
+     return;
+   }
+
+-  session->progress.reset();
+-
+-  /* peak memory usage should show current render peak, not peak for all renders
+-   * made by this render session
+-   */
+-  session->stats.mem_peak = session->stats.mem_used;
++  if (!formal_batch.uploading_after) {
++    session->progress.reset();
++    session->stats.mem_peak = session->stats.mem_used;
++  }
+
+   if (is_new_session) {
+     /* Sync object should be re-created for new scene. */
+@@ -409,7 +423,10 @@
+
+   const BufferParams buffer_params = BlenderSync::get_buffer_params(
+       nullptr, nullptr, scene->camera, width, height);
+-  session->reset(session_params, buffer_params);
++  /* Session::reset cancels active sampling. render() applies the final reset after handoff. */
++  if (!formal_batch.uploading_after) {
++    session->reset(session_params, buffer_params);
++  }
+
+   /* reset time */
+   start_resize_time = 0.0;
+@@ -520,11 +537,13 @@
+   if (formal_request_) {
+     /* The capture worker only writes its private film. It must never call back into the
+      * Blender render result after this invocation returns. */
+-    session->progress.set_update_callback({});
+-    session->progress.set_cancel_callback({});
+-    session->set_display_driver(nullptr);
+-    session->set_output_driver(nullptr);
+-    session->full_buffer_written_cb = nullptr;
++    if (!formal_batch.uploading_after) {
++      session->progress.set_update_callback({});
++      session->progress.set_cancel_callback({});
++      session->set_display_driver(nullptr);
++      session->set_output_driver(nullptr);
++      session->full_buffer_written_cb = nullptr;
++    }
+   }
+   else {
+     ensure_display_driver_if_needed();
+@@ -611,6 +630,36 @@
+     }
+     sync_view();
+     sync->formal_background_previous = nullptr;
++    if (formal_batch.uploading_after) {
++      /* The predecessor published the host scene at its first sample. Build from the
++       * synchronized successor, using the very same Cycles nodes that will be uploaded. */
++      Progress host_progress;
++      host_progress.set_cancel_callback([&] {
++        if (session->progress.get_cancel() || RE_engine_test_break(&b_engine)) {
++          host_progress.set_cancel("Cancelled");
++        }
++      });
++      NativeFrameCaptureScope scope(&formal_request_->capture);
++      if (!formal_request_->take_previous_tree(*scene, host_progress)) {
++        RE_engine_end_result(&b_engine, b_rr, true, false, false);
++        RE_engine_report(&b_engine, 1 << 5, "Failed to acquire the previous frame BVH");
++        return;
++      }
++      scene->geometry_manager->prepare_host_bvh(session->device.get(), scene, host_progress);
++      if (!finish_deferred_predecessor(*session, b_engine)) {
++        RE_engine_end_result(&b_engine, b_rr, true, false, false);
++        return;
++      }
++      if (host_progress.get_error() || host_progress.get_cancel()) {
++        RE_engine_end_result(&b_engine, b_rr, true, false, false);
++        const string reason = host_progress.get_error() ? host_progress.get_error_message() :
++                                                          host_progress.get_cancel_message();
++        RE_engine_report(&b_engine, 1 << 5, reason.c_str());
++        return;
++      }
++      session->progress.reset();
++      session->stats.mem_peak = session->stats.mem_used;
++    }
+     if (BVHExactFrames::producing()) {
+       /* The main persistent session synchronizes N before N+1. Populate the
+        * same object map at N, then evaluate the future frame in this render
+diff --git a/intern/cycles/scene/film.cpp b/intern/cycles/scene/film.cpp
+--- a/intern/cycles/scene/film.cpp
++++ b/intern/cycles/scene/film.cpp
+@@ -531,6 +531,28 @@
+   return false;
+ }
+
++bool Film::geometry_passes_will_change(const Scene &scene) const
++{
++  /* update_passes() rebuilds automatic passes. UV and motion can be requested explicitly,
++   * as the display pass, or (motion only) as denoiser inputs. A change invalidates geometry
++   * buffers, so staged geometry must wait until the film has issued those updates. */
++  const PassType display_pass = get_display_pass();
++  bool have_uv = display_pass == PASS_UV;
++  bool have_motion = display_pass == PASS_MOTION || display_pass == PASS_DENOISING_BACKWARD_MOTION;
++  for (const Pass *pass : scene.passes) {
++    if (!pass->is_auto_) {
++      const PassType type = pass->get_type();
++      have_uv |= type == PASS_UV;
++      have_motion |= type == PASS_MOTION || type == PASS_DENOISING_BACKWARD_MOTION;
++    }
++  }
++  if (scene.integrator->get_use_denoise()) {
++    const DenoiserPassMask denoiser_passes = scene.integrator->get_denoiser_passes();
++    have_motion |= (denoiser_passes & (DENOISER_PASS_MOTION | DENOISER_PASS_BACKWARD_MOTION)) != 0;
++  }
++  return have_uv != prev_have_uv_pass || have_motion != prev_have_motion_pass;
++}
++
+ void Film::update_passes(Scene *scene)
+ {
+   const Background *background = scene->background;
+diff --git a/intern/cycles/scene/film.h b/intern/cycles/scene/film.h
+--- a/intern/cycles/scene/film.h
++++ b/intern/cycles/scene/film.h
+@@ -77,6 +77,7 @@
+
+   /* Update passes so that they contain all passes required for the configured functionality. */
+   void update_passes(Scene *scene);
++  bool geometry_passes_will_change(const Scene &scene) const;
+
+   uint get_kernel_features(const Scene *scene) const;
+
+diff --git a/intern/cycles/scene/geometry.cpp b/intern/cycles/scene/geometry.cpp
+--- a/intern/cycles/scene/geometry.cpp
++++ b/intern/cycles/scene/geometry.cpp
+@@ -20,6 +20,7 @@
+ #include "scene/shader_nodes.h"
+ #include "scene/stats.h"
+ #include "scene/volume.h"
++#include "session/formal_frame.h"
+
+ #include "subd/split.h"
+
+@@ -225,6 +226,14 @@
+ }
+
+ /* Geometry Manager */
++
++struct GeometryManager::HostPreparedBVH {
++  unique_ptr<BVH> tree;
++  uint32_t buffer_flags = 0;
++  bool needs_tree = false;
++  bool displacement_images = false;
++  bool curve_transparency = false;
++};
+
+ GeometryManager::GeometryManager()
+ {
+@@ -429,12 +438,8 @@
+   }
+ }
+
+-void GeometryManager::device_update_preprocess(Device *device, Scene *scene, Progress &progress)
+-{
+-  if (!need_update() && !need_flags_update) {
+-    return;
+-  }
+-
++uint32_t GeometryManager::preprocess_geometry_flags(Device *device, Scene *scene, Progress &progress)
++{
+   uint32_t device_update_flags = 0;
+
+   const scoped_callback_timer timer([scene](double time) {
+@@ -601,6 +606,19 @@
+   if (update_flags & (POINT_ADDED | POINT_REMOVED | MOTION_PASS_NEEDED)) {
+     device_update_flags |= DEVICE_POINT_DATA_NEEDS_REALLOC;
+   }
++
++  return device_update_flags;
++}
++
++void GeometryManager::device_update_preprocess(Device *device, Scene *scene, Progress &progress)
++{
++  if (!need_update() && !need_flags_update) {
++    return;
++  }
++
++  const uint32_t device_update_flags = host_bvh_ ?
++                                           host_bvh_->buffer_flags :
++                                           preprocess_geometry_flags(device, scene, progress);
+
+   /* tag the device arrays for reallocation or modification */
+   DeviceScene *dscene = &scene->dscene;
+@@ -792,19 +810,20 @@
+   image_manager->device_load_images(device, scene, progress, volume_images);
+ }
+
+-void GeometryManager::device_update(Device *device,
+-                                    DeviceScene *dscene,
+-                                    Scene *scene,
+-                                    Progress &progress)
+-{
+-  if (!need_update()) {
+-    return;
+-  }
+-
+-  LOG_INFO << "Total " << scene->geometry.size() << " meshes.";
+-
+-  bool true_displacement_used = false;
+-  bool curve_need_update_shadow_transparency = false;
++static bool keep_local_bvhs(Device *device, Scene *scene, BVHLayout bvh_layout)
++{
++  static const bool prefer_hip_geometry_bvhs = []() {
++    const char *value = std::getenv("CYCLES_FRAMEPIPE_HIP_BLAS");
++    return value && value[0] == '1' && value[1] == '\0';
++  }();
++  return prefer_hip_geometry_bvhs && scene->params.background && device->info.type == DEVICE_HIP &&
++         bvh_layout == BVH_LAYOUT_BVH2;
++}
++
++void GeometryManager::prepare_meshes(Scene *scene, Progress &progress,
++                                     bool &true_displacement_used,
++                                     bool &curve_need_update_shadow_transparency)
++{
+   size_t num_tessellation = 0;
+
+   {
+@@ -937,6 +956,200 @@
+   if (progress.get_cancel()) {
+     return;
+   }
++}
++
++bool GeometryManager::build_geometry_bvhs(Device *device,
++                                          DeviceScene *dscene,
++                                          Scene *scene,
++                                          Progress &progress,
++                                          BVHLayout bvh_layout,
++                                          bool keep_geometry_bvhs)
++{
++  bool need_update_scene_bvh = (scene->bvh == nullptr ||
++                                (update_flags & (TRANSFORM_MODIFIED | VISIBILITY_MODIFIED)) != 0);
++  {
++    const scoped_callback_timer timer([scene](double time) {
++      if (scene->update_stats) {
++        scene->update_stats->geometry.times.add_entry({"device_update (build object BVHs)", time});
++      }
++    });
++
++    size_t i = 0;
++    size_t num_bvh = 0;
++    for (Geometry *geom : scene->geometry) {
++      if (geom->is_modified() || geom->need_update_bvh_for_offset) {
++        need_update_scene_bvh = true;
++
++        if (geom->need_build_bvh(bvh_layout)) {
++          i++;
++          num_bvh++;
++        }
++
++        /* Note the use of #bvh_task_pool_, see its definition for details. */
++        bvh_task_pool_.push([geom, device, dscene, scene, &progress, i, &num_bvh] {
++          geom->compute_bvh(device, dscene, &scene->params, &progress, i, num_bvh);
++        });
++      }
++    }
++
++    TaskPool::Summary summary;
++    bvh_task_pool_.wait_work(&summary);
++    if (keep_geometry_bvhs) {
++      std::fprintf(stderr,
++                   "FRAMEPIPE_HIP_BLAS objects=%zu geometries=%zu scheduled_blas_updates=%zu\n",
++                   scene->objects.size(), scene->geometry.size(), num_bvh);
++    }
++    LOG_DEBUG << "Objects BVH build pool statistics:\n" << summary.full_report();
++  }
++
++  return need_update_scene_bvh;
++}
++
++static void compute_object_bounds(Scene *scene)
++{
++  const Scene::MotionType need_motion = scene->need_motion();
++  const bool motion_blur = need_motion == Scene::MOTION_BLUR;
++
++  /* Update objects. */
++  {
++    const scoped_callback_timer timer([scene](double time) {
++      if (scene->update_stats) {
++        scene->update_stats->geometry.times.add_entry({"device_update (compute bounds)", time});
++      }
++    });
++    for (Object *object : scene->objects) {
++      object->compute_bounds(motion_blur);
++    }
++  }
++}
++
++bool GeometryManager::prepare_host_bvh(Device *device, Scene *scene, Progress &progress)
++{
++  if (!need_update() || !scene->procedurals.empty() || !device->info.multi_devices.empty() ||
++      (device->info.type != DEVICE_HIP && device->info.type != DEVICE_CUDA) ||
++      device->get_bvh_layout_mask(0) != BVH_LAYOUT_BVH2) {
++    formal_frame_mark_stage("host_bvh_ineligible_scene");
++    return false;
++  }
++  if (scene->film->geometry_passes_will_change(*scene)) {
++    formal_frame_mark_stage("host_bvh_ineligible_render_pass_change");
++    return false;
++  }
++  /* CPU compilation has not yet updated shader feature flags. Only materials actually used by
++   * geometry can affect this BVH. An evaluated volume mesh or true displacement may require
++   * target-device values. Keep those scenes on the normal native update path. */
++  for (Geometry *geom : scene->geometry) {
++    if (geom->is_light()) {
++      continue;
++    }
++    for (Node *node : geom->get_used_shaders()) {
++      if (node->is_modified()) {
++        formal_frame_mark_stage("host_bvh_ineligible_shader");
++        return false;
++      }
++    }
++    if (geom->is_volume() && (geom->is_modified() || (update_flags & VOLUME_MODIFIED))) {
++      formal_frame_mark_stage("host_bvh_ineligible_volume");
++      return false;
++    }
++    if (geom->is_mesh() && geom->is_modified()) {
++      Mesh *mesh = static_cast<Mesh *>(geom);
++      if (mesh->need_tesselation() || (mesh->num_triangles() && mesh->has_true_displacement())) {
++        formal_frame_mark_stage("host_bvh_ineligible_mesh_evaluation");
++        return false;
++      }
++    }
++  }
++  const Scene::MotionType motion = scene->need_motion();
++  if (motion != Scene::MOTION_NONE && scene->object_manager->need_update()) {
++    if (motion != Scene::MOTION_BLUR) {
++      /* In a vector pass the native object path captures the center transform before it
++       * hides particles with missing steps. Preserve that sequencing on its normal path. */
++      for (Object *ob : scene->objects) {
++        if (ob->get_hide_on_missing_motion() && ob->use_motion() &&
++            std::find(ob->get_motion().begin(), ob->get_motion().end(), transform_empty()) !=
++                ob->get_motion().end()) {
++          formal_frame_mark_stage("host_bvh_ineligible_missing_motion");
++          return false;
++        }
++      }
++    }
++    for (Object *ob : scene->objects) {
++      ob->update_motion();
++    }
++  }
++
++  auto staged = make_unique<HostPreparedBVH>();
++  staged->buffer_flags = preprocess_geometry_flags(device, scene, progress);
++  prepare_meshes(scene, progress, staged->displacement_images, staged->curve_transparency);
++  if (progress.get_cancel()) {
++    return false;
++  }
++
++  /* The native mesh/instance offsets and transformed geometry are authoritative for this frame.
++   * Applying the object flag to device-scene buffers still happens at normal device update. */
++  geom_calc_offset(scene, BVH_LAYOUT_BVH2);
++  const bool keep_geometry_bvhs = keep_local_bvhs(device, scene, BVH_LAYOUT_BVH2);
++  if (scene->params.bvh_type == BVH_TYPE_STATIC && !keep_geometry_bvhs) {
++    scene->object_manager->apply_static_transforms(nullptr, scene, progress);
++  }
++
++  /* CPU-only arguments used by BVH2; none of the device vectors in this local are allocated. */
++  DeviceScene host_inputs(device);
++  for (Object *object : scene->objects) {
++    if (object->get_geometry()->is_hair()) {
++      host_inputs.data.bvh.have_curves = true;
++      break;
++    }
++  }
++  if (staged->buffer_flags & (DEVICE_MESH_DATA_NEEDS_REALLOC | DEVICE_CURVE_DATA_NEEDS_REALLOC |
++                              DEVICE_POINT_DATA_NEEDS_REALLOC)) {
++    scene->bvh.reset();
++  }
++  staged->needs_tree = build_geometry_bvhs(
++      device, &host_inputs, scene, progress, BVH_LAYOUT_BVH2, keep_geometry_bvhs);
++  compute_object_bounds(scene);
++  if (progress.get_cancel()) {
++    return false;
++  }
++  if (staged->needs_tree) {
++    build_scene_bvh(device, &host_inputs, scene, progress);
++    if (progress.get_cancel()) {
++      return false;
++    }
++    staged->tree = std::move(scene->bvh);
++    formal_frame_mark_stage("host_bvh_ready");
++  }
++  else {
++    formal_frame_mark_stage("host_bvh_unchanged");
++  }
++  host_bvh_ = std::move(staged);
++  return true;
++}
++
++void GeometryManager::device_update(Device *device,
++                                    DeviceScene *dscene,
++                                    Scene *scene,
++                                    Progress &progress)
++{
++  if (!need_update()) {
++    return;
++  }
++
++  LOG_INFO << "Total " << scene->geometry.size() << " meshes.";
++
++  bool true_displacement_used = false;
++  bool curve_need_update_shadow_transparency = false;
++  if (host_bvh_) {
++    true_displacement_used = host_bvh_->displacement_images;
++    curve_need_update_shadow_transparency = host_bvh_->curve_transparency;
++  }
++  else {
++    prepare_meshes(scene, progress, true_displacement_used, curve_need_update_shadow_transparency);
++  }
++  if (progress.get_cancel()) {
++    return;
++  }
+
+   /* Update images needed for true displacement. */
+   if (true_displacement_used || curve_need_update_shadow_transparency) {
+@@ -973,12 +1186,7 @@
+   /* A persistent animation worker can keep object-local geometry and its native BVH2
+    * instead of flattening single-user geometry into the top-level tree every frame.
+    * Latch the option: switching space after vertices were transformed would be unsafe. */
+-  static const bool prefer_hip_geometry_bvhs = []() {
+-    const char *value = std::getenv("CYCLES_FRAMEPIPE_HIP_BLAS");
+-    return value && value[0] == '1' && value[1] == '\0';
+-  }();
+-  const bool keep_geometry_bvhs = prefer_hip_geometry_bvhs && scene->params.background &&
+-                                  device->info.type == DEVICE_HIP && bvh_layout == BVH_LAYOUT_BVH2;
++  const bool keep_geometry_bvhs = keep_local_bvhs(device, scene, bvh_layout);
+   if (scene->params.bvh_type == BVH_TYPE_STATIC && !keep_geometry_bvhs) {
+     const scoped_callback_timer timer([scene](double time) {
+       if (scene->update_stats) {
+@@ -1087,43 +1295,8 @@
+    * Also update the BVH if the transformations change, we cannot rely on tagging the Geometry
+    * as modified in this case, as we may accumulate displacement if the vertices do not also
+    * change. */
+-  bool need_update_scene_bvh = (scene->bvh == nullptr ||
+-                                (update_flags & (TRANSFORM_MODIFIED | VISIBILITY_MODIFIED)) != 0);
+-  {
+-    const scoped_callback_timer timer([scene](double time) {
+-      if (scene->update_stats) {
+-        scene->update_stats->geometry.times.add_entry({"device_update (build object BVHs)", time});
+-      }
+-    });
+-
+-    size_t i = 0;
+-    size_t num_bvh = 0;
+-    for (Geometry *geom : scene->geometry) {
+-      if (geom->is_modified() || geom->need_update_bvh_for_offset) {
+-        need_update_scene_bvh = true;
+-
+-        if (geom->need_build_bvh(bvh_layout)) {
+-          i++;
+-          num_bvh++;
+-        }
+-
+-        /* Note the use of #bvh_task_pool_, see its definition for details. */
+-        bvh_task_pool_.push([geom, device, dscene, scene, &progress, i, &num_bvh] {
+-          geom->compute_bvh(device, dscene, &scene->params, &progress, i, num_bvh);
+-        });
+-      }
+-    }
+-
+-    TaskPool::Summary summary;
+-    bvh_task_pool_.wait_work(&summary);
+-    if (keep_geometry_bvhs) {
+-      std::fprintf(stderr,
+-                   "FRAMEPIPE_HIP_BLAS objects=%zu geometries=%zu scheduled_blas_updates=%zu\n",
+-                   scene->objects.size(), scene->geometry.size(), num_bvh);
+-    }
+-    LOG_DEBUG << "Objects BVH build pool statistics:\n" << summary.full_report();
+-  }
+-
++  const bool need_update_scene_bvh = host_bvh_ ? host_bvh_->needs_tree : build_geometry_bvhs(
++      device, dscene, scene, progress, bvh_layout, keep_geometry_bvhs);
+   for (Shader *shader : scene->shaders) {
+     shader->need_update_uvs = false;
+     shader->need_update_attribute = false;
+@@ -1132,21 +1305,12 @@
+     shader->shadow_transparency_needs_realloc = false;
+   }
+
+-  const Scene::MotionType need_motion = scene->need_motion();
+-  const bool motion_blur = need_motion == Scene::MOTION_BLUR;
+-
+-  /* Update objects. */
+-  {
+-    const scoped_callback_timer timer([scene](double time) {
+-      if (scene->update_stats) {
+-        scene->update_stats->geometry.times.add_entry({"device_update (compute bounds)", time});
+-      }
+-    });
+-    for (Object *object : scene->objects) {
+-      object->compute_bounds(motion_blur);
+-    }
+-  }
+-
++  if (!host_bvh_) {
++    compute_object_bounds(scene);
++  }
++  else if (!need_update_scene_bvh) {
++    host_bvh_.reset();
++  }
+   if (progress.get_cancel()) {
+     return;
+   }
+@@ -1157,7 +1321,15 @@
+         scene->update_stats->geometry.times.add_entry({"device_update (build scene BVH)", time});
+       }
+     });
+-    device_update_bvh(device, dscene, scene, progress);
++    if (host_bvh_) {
++      scene->bvh = std::move(host_bvh_->tree);
++      host_bvh_.reset();
++      formal_frame_mark_stage("bvh_pack_consumed");
++      upload_scene_bvh(dscene, scene, progress, true);
++    }
++    else {
++      device_update_bvh(device, dscene, scene, progress);
++    }
+     if (progress.get_cancel()) {
+       return;
+     }
+diff --git a/intern/cycles/scene/geometry.h b/intern/cycles/scene/geometry.h
+--- a/intern/cycles/scene/geometry.h
++++ b/intern/cycles/scene/geometry.h
+@@ -266,6 +266,9 @@
+   void update_interactive_motion(Scene *scene);
+
+   /* Device Updates */
++  /* Run on the production host scene after sync, while the preceding GPU frame is frozen. */
++  bool has_host_bvh() const { return host_bvh_ != nullptr; }
++  bool prepare_host_bvh(Device *device, Scene *scene, Progress &progress);
+   void device_update_preprocess(Device *device, Scene *scene, Progress &progress);
+   void device_update(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress);
+   void device_free(Device *device, DeviceScene *dscene, bool force_free);
+@@ -308,6 +311,16 @@
+   void device_update_displacement_images(Device *device, Scene *scene, Progress &progress);
+
+   void device_update_volume_images(Device *device, Scene *scene, Progress &progress);
++
++ private:
++  struct HostPreparedBVH;
++  unique_ptr<HostPreparedBVH> host_bvh_;
++  uint32_t preprocess_geometry_flags(Device *device, Scene *scene, Progress &progress);
++  void prepare_meshes(Scene *scene, Progress &progress, bool &displacement, bool &curve_transparency);
++  bool build_geometry_bvhs(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress,
++                           BVHLayout layout, bool keep_geometry_bvhs);
++  bool build_scene_bvh(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress);
++  void upload_scene_bvh(DeviceScene *dscene, Scene *scene, Progress &progress, bool has_bvh2_layout);
+ };
+
+ CCL_NAMESPACE_END
+diff --git a/intern/cycles/scene/geometry_bvh.cpp b/intern/cycles/scene/geometry_bvh.cpp
+--- a/intern/cycles/scene/geometry_bvh.cpp
++++ b/intern/cycles/scene/geometry_bvh.cpp
+@@ -99,7 +99,7 @@
+   need_update_bvh_for_offset = false;
+ }
+
+-void GeometryManager::device_update_bvh(Device *device,
++bool GeometryManager::build_scene_bvh(Device *device,
+                                         DeviceScene *dscene,
+                                         Scene *scene,
+                                         Progress &progress)
+@@ -146,12 +146,26 @@
+     static_cast<BVH2 *>(bvh)->frame_lookahead = nullptr;
+   }
+   device->build_bvh(bvh, progress, can_refit);
+-
+-  if (progress.get_cancel()) {
+-    return;
+-  }
+-
+-  const bool has_bvh2_layout = (bparams.bvh_layout == BVH_LAYOUT_BVH2);
++  return bparams.bvh_layout == BVH_LAYOUT_BVH2;
++}
++
++void GeometryManager::device_update_bvh(Device *device,
++                                        DeviceScene *dscene,
++                                        Scene *scene,
++                                        Progress &progress)
++{
++  const bool has_bvh2_layout = build_scene_bvh(device, dscene, scene, progress);
++  if (!progress.get_cancel()) {
++    upload_scene_bvh(dscene, scene, progress, has_bvh2_layout);
++  }
++}
++
++void GeometryManager::upload_scene_bvh(DeviceScene *dscene,
++                                       Scene *scene,
++                                       Progress &progress,
++                                       const bool has_bvh2_layout)
++{
++  BVH *bvh = scene->bvh.get();
+
+   PackedBVH pack;
+   if (has_bvh2_layout) {
+diff --git a/intern/cycles/scene/object.cpp b/intern/cycles/scene/object.cpp
+--- a/intern/cycles/scene/object.cpp
++++ b/intern/cycles/scene/object.cpp
+@@ -650,7 +650,9 @@
+       state->need_motion == Scene::MOTION_PASS_INTERACTIVE)
+   {
+     /* Clear motion array if there is no actual motion. */
+-    ob->update_motion();
++    if (!scene->geometry_manager->has_host_bvh()) {
++      ob->update_motion();
++    }
+
+     /* Compute motion transforms. */
+     Transform tfm_pre;
+@@ -820,7 +822,9 @@
+       motion_offsets++;
+
+       /* Clear motion array if there is no actual motion. */
+-      ob->update_motion();
++      if (!scene->geometry_manager->has_host_bvh()) {
++        ob->update_motion();
++      }
+       motion_offset += ob->motion.size();
+     }
+
+@@ -1197,7 +1201,7 @@
+     return;
+   }
+
+-  uint *object_flag = dscene->object_flag.data();
++  uint *object_flag = dscene ? dscene->object_flag.data() : nullptr;
+
+   /* apply transforms for objects with single user geometry */
+   for (Object *object : scene->objects) {
+@@ -1232,7 +1236,9 @@
+           }
+         }
+
+-        object_flag[i] |= SD_OBJECT_TRANSFORM_APPLIED;
++        if (object_flag) {
++          object_flag[i] |= SD_OBJECT_TRANSFORM_APPLIED;
++        }
+       }
+     }
+
+diff --git a/intern/cycles/session/formal_frame.h b/intern/cycles/session/formal_frame.h
+--- a/intern/cycles/session/formal_frame.h
++++ b/intern/cycles/session/formal_frame.h
+@@ -69,10 +69,15 @@
+
+   const int frame;
+   NativeFrameCapture capture;
++  bool defer_upload = false;
++  /* Published before the sample_begin notification. The render thread works exclusively
++   * from its prepared device state for the rest of this frame. */
++  bool host_scene_available = false;
+
+  private:
+   std::shared_ptr<FormalFrame> predecessor_;
+   std::unique_ptr<BVHFrameLookahead> retained_tree_;
++  bool previous_tree_taken_ = false;
+   std::mutex mutex_;
+   std::condition_variable changed_;
+   bool ready_ = false;
+diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.cpp
+--- a/intern/cycles/session/session.cpp
++++ b/intern/cycles/session/session.cpp
+@@ -66,7 +66,7 @@
+
+ bool FormalFrame::take_previous_tree(Scene &scene, Progress &progress)
+ {
+-  if (!predecessor_) {
++  if (!predecessor_ || previous_tree_taken_) {
+     return true;
+   }
+   std::unique_lock lock(predecessor_->mutex_);
+@@ -81,6 +81,7 @@
+     return false;
+   }
+   scene.frame_lookahead = std::move(predecessor_->retained_tree_);
++  previous_tree_taken_ = true;
+   if (scene.frame_lookahead) {
+     mark("bvh_handoff");
+   }
+@@ -302,7 +303,19 @@
+   bool started_sampling = false;
+
+   while (true) {
+-    RenderWork render_work = run_update_for_next_iteration();
++    RenderWork render_work;
++    if (started_sampling && formal && formal->host_scene_available) {
++      /* A single background tile already owns its buffers, pass descriptions, constant
++       * data, adaptive settings and full-resolution camera. Only advance its scheduler.
++       * scene->update() here would upload the successor's partially synchronized nodes. */
++      render_work = render_scheduler_.get_render_work();
++      if (!render_work) {
++        progress.add_finished_tile(false);
++      }
++    }
++    else {
++      render_work = run_update_for_next_iteration();
++    }
+
+     const bool did_cancel = progress.get_cancel();
+
+@@ -345,6 +358,18 @@
+     }
+
+     if (formal && !started_sampling && render_work.path_trace.num_samples > 0) {
++      /* Tiled image faults can call back into the host image manager. Pixel jitter also
++       * updates the camera's kernel constants between batches. Keep their normal loop. */
++      formal->host_scene_available =
++          formal->defer_upload &&
++          (device->info.type == DEVICE_HIP || device->info.type == DEVICE_CUDA) &&
++          scene->bvh && scene->bvh->params.bvh_layout == BVH_LAYOUT_BVH2 &&
++          scene->params.shadingsystem == SHADINGSYSTEM_SVM &&
++          !tile_manager_.has_multiple_tiles() && !scene->integrator->get_use_pixel_jitter() &&
++          scene->dscene.image_texture_tile_access_state.size() == 0;
++      if (formal->defer_upload) {
++        formal->mark(formal->host_scene_available ? "host_scene_released" : "host_scene_in_use");
++      }
+       if (!formal->begin_sampling(*scene, progress)) {
+         break;
+       }
+@@ -361,7 +386,8 @@
+       update_status_time();
+
+       /* render */
+-      if (scene->frame_lookahead && render_work.path_trace.num_samples > 0) {
++      if ((!formal || !formal->host_scene_available) && scene->frame_lookahead &&
++          render_work.path_trace.num_samples > 0) {
+         scene->frame_lookahead->start();
+       }
+       path_trace_->render(render_work);

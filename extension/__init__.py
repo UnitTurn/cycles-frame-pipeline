@@ -44,9 +44,10 @@ class FramePipelineSettings(PropertyGroup):
     output: StringProperty(**_label('output'), subtype='DIR_PATH', default=UI['output.default'])
     mode: EnumProperty(**_label('mode'), items=[_option('native'), _option('serial'), _option('compositor')],
                        default='native')
-    lookahead: BoolProperty(**_label('lookahead'), default=False)
+    lookahead: BoolProperty(**_label('lookahead'), default=True)
     bvh_input: EnumProperty(**_label('bvh_input'), items=[_option('auto'), _option('next'),
                             _option('previous'), _option('prepared')], default='auto')
+    defer_upload: BoolProperty(**_label('defer_upload'), default=True)
     threads: IntProperty(**_label('threads'), default=6, min=1, max=128)
     existing: EnumProperty(**_label('existing'), items=[_option('error'), _option('skip'), _option('replace')])
 
@@ -89,7 +90,9 @@ def _read_log(job, final=False):
                 job['done'] += 1
         elif total := re.fullmatch(r'PIPELINE_TOTAL\s+(\d+)', line):
             job['total'] = int(total[1])
-        if line.startswith('PIPELINE_MODE serial'):
+        if line == 'PIPELINE_DEFER_UPLOAD_UNSUPPORTED':
+            job['error'] = UI['err.defer_backend']
+        elif line.startswith('PIPELINE_MODE serial'):
             job['fallback'] = line[:170]
         elif line.startswith(('FRAMEPIPE_EXACT ', 'FRAMEPIPE_BVH ')):
             if 'hit=' in line:
@@ -117,7 +120,7 @@ def _poll():
         if job['snapshot']:
             job['snapshot'].unlink(missing_ok=True)
         if code:
-            state = UI['status.exit'].format(code=code)
+            state = job.get('error') or UI['status.exit'].format(code=code)
         elif job['done'] + job['skipped'] == job['total']:
             state = UI['status.complete'].format(**job)
         elif job['stop'].exists():
@@ -156,9 +159,14 @@ class FRAMEPIPE_OT_start(Operator):
             exe = Path(bpy.app.binary_path)
             if cfg.lookahead and cfg.bvh_input == 'prepared' and cfg.mode != 'native':
                 raise ValueError(UI['err.mode'])
+            prepared = cfg.lookahead and cfg.mode == 'native' and cfg.bvh_input in {'auto', 'prepared'}
+            defer_upload = prepared and cfg.defer_upload
             backend = context.preferences.addons[__package__].preferences.backend
-            if cfg.lookahead and not backend:
+            auto_prepared = defer_upload and cfg.bvh_input == 'auto'
+            if cfg.lookahead and not backend and not auto_prepared:
                 import _cycles
+                if defer_upload and not getattr(_cycles, 'with_host_bvh_packing', False):
+                    raise ValueError(UI['err.defer_backend'])
                 if not getattr(_cycles, 'with_exact_bvh', False):
                     raise ValueError(UI['err.backend'])
             if backend and (cfg.lookahead or cfg.mode != 'compositor'):
@@ -201,6 +209,8 @@ class FRAMEPIPE_OT_start(Operator):
                      '--post-threads', str(cfg.threads), '--stop-file', str(stop), '--existing', cfg.existing,
                      '--profile', cfg.profile, '--mode', cfg.mode,
                      '--bvh-input', cfg.bvh_input if cfg.lookahead else 'off']
+            if prepared and not defer_upload:
+                args.append('--eager-upload')
             if not external:
                 args += ['--start', str(scene.frame_start), '--end', str(scene.frame_end), '--step', str(scene.frame_step)]
             environment = os.environ.copy()
@@ -281,6 +291,8 @@ class FRAMEPIPE_PT_render(Panel):
         group.prop(cfg, 'lookahead')
         if cfg.lookahead:
             group.prop(cfg, 'bvh_input')
+            if cfg.mode == 'native' and cfg.bvh_input in {'auto', 'prepared'}:
+                group.prop(cfg, 'defer_upload')
         if cfg.lookahead or cfg.mode != 'compositor':
             group.prop(context.preferences.addons[__package__].preferences, 'backend')
         group.operator(FRAMEPIPE_OT_start.bl_idname, icon='RENDER_ANIMATION')

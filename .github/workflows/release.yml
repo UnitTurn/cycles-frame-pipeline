@@ -47,4 +47,6 @@ jobs:
       - name: Publish the language-specific packages and common source archive
         run: |
           set -euo pipefail
-          gh release create "$TAG" dist/*.zip --verify-tag --title "Cycles Frame Pipeline $TAG" --notes-file release/notes.md
+          title=$(sed -n '1s/^# //p' release/notes.md)
+          test -n "$title"
+          gh release create "$TAG" dist/*.zip --verify-tag --title "$title" --notes-file release/notes.md

@@ -85,8 +85,8 @@ def main():
         raw.unlink()
         if job.get("frame_graph"):
             frame_path.unlink()
-        (working / f"{frame}.done").touch()
         print(f"PIPELINE_FRAME_DONE {frame}", flush=True)
+        (working / f"{frame}.done").touch()
 
 
 if __name__ == "__main__":

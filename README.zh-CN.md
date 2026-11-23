@@ -2,27 +2,31 @@
 
 [English](README.md) · 简体中文
 
-让一张显卡连续渲染 Blender 动画。GPU 采样第 **N** 帧时，Blender 按动画顺序对第 **N+1** 帧做正式场景求值，第二个 Cycles 会话准备该帧的场景数据和加速结构。切帧时直接用准备好的会话采样，省去重复求值。后台 CPU 进程同时为前一帧降噪，并输出编号 PNG。
+Cycles 帧间流水线 0.5.0 默认使用**主机端 BVH 预打包**。对支持的软件 BVH2 场景，GPU 采样第 **N** 帧时，Blender 按原帧序求值第 **N+1** 帧，Cycles 在 CPU 上正式校验几何输入、完成 BVH 打包，将结果留在系统内存。切帧时，同一个 Cycles 会话直接取包上传并开始采样。前一帧的处理与 PNG 输出由后台 CPU 进程完成。
 
-Windows 发行包提供 AMD HIP 和 NVIDIA CUDA、OptiX。公开的 Ruins 耗时与成片对照来自 RX 7800 XT 的 HIP 实测。两个 NVIDIA 后端均已在 RTX 3090 上完成独立的三帧回归场景。[显卡与 Blender 兼容范围](#显卡与-blender-兼容范围) · [已公开的 Ruins 基准](benchmarks/README.zh-CN.md)
+Windows 引擎包含 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。本页的主机端 BVH 预打包基准来自 RX 7800 XT 的 HIP 实测。[显卡与 Blender 兼容范围](#显卡与-blender-兼容范围) · [Ruins 基准](benchmarks/README.zh-CN.md)
 
-**RX 7800 XT 的 1,000 帧耗时估算。** 如果一段 1080p 动画的出图节拍与 Ruins 第 624–633 帧实测相同，流水线预计节省 **3 小时 29 分 26 秒**。下表统一比较从启动到末张 PNG 写完的耗时，降幅按 `（官方耗时 − 流水线耗时）/ 官方耗时` 计算。
+<!-- benchmark-projection:begin -->
 
-| 帧数与数据来源 | 官方 Blender | 发布版 | 耗时降幅 |
+**Radeon RX 7800 XT 实测。** 开启主机端 BVH 预打包后，Ruins 第 624–633 帧的最后一张 PNG 提前了 **103.801 秒**写完。如果后续镜头维持这段动画的出图节拍，1,000 帧预计节省 **3 小时 25 分 18 秒**。
+
+| 帧数与数据来源 | 官方 Blender | v0.5.0 默认设置 | 耗时降幅 |
 |---|---:|---:|---:|
-| 10 帧 · 实测 | 560.25 秒 | 466.03 秒 | **16.82%** |
-| 1,000 帧 · 推算 | 11 小时 29 分 41 秒 | 8 小时 00 分 15 秒 | **30.37%** |
+| 10 帧 · 实测 | 576.072 秒 | 472.271 秒 | **18.02%** |
+| 1,000 帧 · 估算 | 11 小时 51 分 36 秒 | 8 小时 26 分 18 秒 | **28.85%** |
 
-![RX 7800 XT 十帧实测耗时降幅与一千帧推算耗时降幅](benchmarks/projection-zh.png)
+![从启动到末张 PNG 写完的耗时降幅，分别展示十帧实测和一千帧估算](benchmarks/projection-zh.png)
 
-估算只计一次启动耗时，用实测的九个出图间隔推算其余帧。`千帧耗时 = 首张 PNG 耗时 + 999 × (第十张 PNG 耗时 − 首张 PNG 耗时) / 9`。以启动为起点，官方的两项原始读数为 189.144 和 560.246 秒，发布版为 208.306 和 466.027 秒。镜头的几何复杂度或采样负担变化时，实际出图间隔也会变化。
+估算只计一次首帧耗时，其余 999 帧采用实测九个出图间隔的平均值。两行的耗时降幅均以同帧数的官方 Blender 耗时为分母。
 
-[安装](#安装) · [渲染动画](#渲染动画) · [实测与成片对照](#实测与成片对照) · [从源码构建并验证](#从源码构建并验证)
+<!-- benchmark-projection:end -->
+
+[安装](#安装) · [渲染动画](#渲染动画) · [渲染性能基准](#渲染性能基准) · [从源码构建并验证](#从源码构建并验证)
 
 ## 适用场景
 
-- **作业类型。** 按顺序渲染 Cycles 动画，前一帧采样结束与下一帧采样开始之间有明显空档。几何、相机、运动模糊和材质均按原帧序求值。两个会话同时持有设备数据，需要额外显存和系统内存。首帧仍要承担加载场景和初始化的耗时。
-- **场景与输出。** 启用单个视图层、单视图、Combined 通道和 PNG 输出，在场景和视图层上均开启最终渲染降噪，使用 CPU Open Image Denoise。仅使用 Combined 图像和 alpha、且依赖受支持的合成器可在后台重放。多视图、参与输出的视频序列、带动画的合成节点树、局部渲染边框、自定义色彩曲线等设置需要串行处理。「并行准备下一正式帧」遇到不支持的设置会在提交时报告原因。[兼容条件](pipeline/composition.py)
+- **作业类型。** 适用于相邻帧 GPU 采样之间有明显空档的 Cycles 动画。上一帧的采样时间越能覆盖下一帧的 BVH 准备时间，越能缩短切帧等待。系统内存需容纳下一帧打好的包，显卡只保留当前设备场景。首帧仍要加载场景和初始化。
+- **场景与输出。** 启用单个视图层、单视图、Combined 通道和 PNG 输出，在场景和视图层上均开启最终渲染降噪，使用 CPU Open Image Denoise。仅使用 Combined 图像和 alpha、且依赖受支持的合成器可在后台重放。多视图、参与输出的视频序列、带动画的合成节点树、局部渲染边框、自定义色彩曲线等设置需要串行处理。默认的自动模式可回退到串行输出。需要强制使用指定流水线时，传入 `--fallback error`。[兼容条件](pipeline/composition.py)
 
 ## 显卡与 Blender 兼容范围
 
@@ -31,17 +35,17 @@ Windows 发行包提供 AMD HIP 和 NVIDIA CUDA、OptiX。公开的 Ruins 耗时
 | 后端 | 项目实机验证 | Windows x64 理论范围 |
 |---|---|---|
 | AMD HIP | Radeon RX 7800 XT，软件 BVH2 | RDNA 1 及更新架构，例如 Radeon RX 5000、6000、7000 和 9000 系列。Blender 列出的 Windows 最低驱动为 Radeon Software 24.9.1 或 Radeon PRO Software 24.Q4。 |
-| NVIDIA CUDA | GeForce RTX 3090，软件 BVH2 | 计算能力 5.0 及以上，驱动能加载对应的 Blender CUDA 内核。例如 GeForce RTX 20、30、40 和 50 系列。 |
-| NVIDIA OptiX | GeForce RTX 3090，OptiX 原生加速结构 | 计算能力 5.0 及以上，NVIDIA 驱动 575 或更新。RTX 显卡可用 RT 核心加速光线追踪。 |
+| NVIDIA CUDA | v0.4.0 已在 RTX 3090 上验证渲染。0.5.0 的软件 BVH2 路径在设计上支持主机端预打包。 | 计算能力 5.0 及以上，驱动能加载对应的 Blender CUDA 内核。 |
+| NVIDIA OptiX | v0.4.0 已在 RTX 3090 上验证渲染。OptiX 使用自己的原生加速结构。 | 计算能力 5.0 及以上，NVIDIA 驱动 575 或更新。RTX 显卡可使用 RT 核心。 |
 
-理论范围依据 Blender 5.2 的设备要求。官方 5.2.1 Windows 运行包提供预编译 CUDA 内核和备用 PTX，主要 OptiX PTX 内核的编译目标为 `sm_50`。其他型号须能用匹配的官方 Blender 在所选后端完成渲染，并有足够内存容纳两个会话。耗时和像素差数据只对应具体实测卡、后端和场景。本发行包面向单卡作业，未提供 HIP RT、Intel oneAPI 或 Apple Metal 后端。[Blender 5.2 官方 GPU 要求](https://docs.blender.org/manual/zh-hans/5.2/render/cycles/gpu_rendering.html) · [NVIDIA 显卡计算能力查询](https://developer.nvidia.com/cuda/gpus)
+理论范围依据本项目固定的 Blender 5.2 运行时要求。Windows 包提供单卡 HIP、CUDA 和 OptiX。公开耗时来自下方指定的 AMD 配置。[Blender 5.2 官方 GPU 要求](https://docs.blender.org/manual/zh-hans/5.2/render/cycles/gpu_rendering.html) · [NVIDIA 显卡计算能力查询](https://developer.nvidia.com/cuda/gpus)
 
-HIP 和 CUDA 在复用前一帧的软件 BVH2 时校验输入，输入变化会触发重新构建。OptiX 使用自己的加速结构准备下一帧。三个后端均可提前准备下一帧，并把 CPU 降噪和 PNG 输出安排在后续帧采样期间。路径追踪可选 GPU，最终降噪选择 CPU Open Image Denoise。
+在符合条件的场景中，HIP 和 CUDA 提前校验并打包原生软件 BVH2。使用默认上传策略时，OptiX 在切帧时构建自己的设备加速结构。也可显式选择提前上传，由第二个 Cycles 会话准备下一帧的设备数据，需要更多显存。
 
 ## 安装
 
 1. 安装官方 **Blender 5.2.1 LTS Windows x64**。配套程序使用同一版本的 Blender 运行库以及 HIP、CUDA 和 OptiX 内核，安装脚本会检查官方构建的提交号。
-2. 从[最新发行版](https://github.com/expitau-one/cycles-frame-pipeline/releases/latest)下载简体中文版的 Windows 引擎覆盖包 `cycles-frame-pipeline-windows-x64-0.4.0-zh-CN.zip`（含中文安装程序）和扩展 `cycles_frame_pipeline-0.4.0-zh-CN.zip`。两种语言的扩展使用相同的扩展 ID 和引擎，选择其中一种安装。按下例将引擎覆盖包解压到 `.\downloads\engine`，从工作目录打开 PowerShell，运行包内的中文安装脚本。按实际情况填写官方 Blender 安装位置，并为配套引擎选择一个尚不存在的目标目录。
+2. 从[最新发行版](https://github.com/UnitTurn/cycles-frame-pipeline/releases/latest)下载简体中文版的 Windows 引擎覆盖包 `cycles-frame-pipeline-windows-x64-0.5.0-zh-CN.zip`（含中文安装程序）和扩展 `cycles_frame_pipeline-0.5.0-zh-CN.zip`。两种语言的扩展使用相同的扩展 ID 和引擎，选择其中一种安装。按下例将引擎覆盖包解压到 `.\downloads\engine`，从工作目录打开 PowerShell，运行包内的中文安装脚本。按实际情况填写官方 Blender 安装位置，并为配套引擎选择一个尚不存在的目标目录。
 
    ```powershell
    .\downloads\engine\install_backend.ps1 `
@@ -56,7 +60,7 @@ HIP 和 CUDA 在复用前一帧的软件 BVH2 时校验输入，输入变化会�
    .\backend\open_blender.ps1
    ```
 
-4. **在刚打开的窗口中**进入「编辑 → 偏好设置 → 获取扩展」，打开菜单，选择「从磁盘安装」。选中 `cycles_frame_pipeline-0.4.0-zh-CN.zip`，使用默认用户扩展仓库，启用 **Cycles 帧间流水线**。下次使用同一脚本启动。简体中文版的偏好设置和默认扩展保存在 `%LOCALAPPDATA%\CyclesFramePipeline\5.2\zh_HANS`。首次启动时会继承已有的启动配置和默认用户扩展。
+4. **在刚打开的窗口中**进入「编辑 → 偏好设置 → 获取扩展」，打开菜单，选择「从磁盘安装」。选中 `cycles_frame_pipeline-0.5.0-zh-CN.zip`，使用默认用户扩展仓库，启用 **Cycles 帧间流水线**。下次使用同一脚本启动。简体中文版的偏好设置和默认扩展保存在 `%LOCALAPPDATA%\CyclesFramePipeline\5.2\zh_HANS`。首次启动时会继承已有的启动配置和默认用户扩展。
 
 **使用平时的 Blender 配置。** 直接启动 `backend\blender.exe` 时，会沿用原有 Blender 语言与偏好设置。也可以在官方 Blender 窗口中安装简体中文扩展，将「定制 Blender 程序」指向配套的 `backend\blender.exe` 后提交渲染。下文命令行用法需要源码中的脚本和配套引擎。
 
@@ -65,45 +69,51 @@ HIP 和 CUDA 在复用前一帧的软件 BVH2 时校验输入，输入变化会�
 
 **选择显卡。** 在用于渲染的 Blender 配置中打开「编辑 → 偏好设置 → 系统 → Cycles 渲染设备」，选择 **HIP**、**CUDA** 或 **OptiX**，只勾选目标显卡并保存偏好设置。在源场景的「渲染属性 → Cycles → 设备」中选择「GPU 计算」。最终渲染降噪选择 **OpenImageDenoise**，关闭降噪的「使用 GPU」。从磁盘提交时先保存场景。
 
-**通过 Blender 界面。** 在「渲染属性 → Cycles 帧间流水线」选择当前场景或磁盘上的 `.blend`，选择「使用场景设置」，设置 PNG 输出目录和「Cycles 原生降噪与输出」。勾选「优化原版 BVH（配套引擎）」，在「BVH 输入」中选择「并行准备下一正式帧」，点击「启动流水线渲染」。按照千帧示例，将场景帧范围设为 1–1000、步长设为 1。面板按写完的 PNG 统计进度。大型场景可以从空白 Blender 窗口选择磁盘文件提交。
+**通过 Blender 界面。** 在「渲染属性 → Cycles 帧间流水线」选择当前场景或磁盘上的 `.blend`，选择「使用场景设置」，设置 PNG 输出目录，点击「启动流水线渲染」。新配置默认使用「主机端 BVH 预打包」。千帧示例将场景帧范围设为 1–1000，步长设为 1。大型场景可从空白 Blender 窗口提交磁盘文件。
 
 **通过命令行。** 在项目根目录运行，把 `.\scene.blend` 换成自己的场景。下例使用已保存的渲染设置，输出 `0001.png` 到 `1000.png`。后台进程读取其启动时所用 Blender 配置中的渲染设备偏好。
 
 ```powershell
 & .\backend\blender.exe -b '.\scene.blend' --python-exit-code 9 -P .\pipeline\render.py -- `
     --output '.\renders' --start 1 --end 1000 --step 1 `
-    --profile scene --mode native --bvh-input prepared --post-threads 6
+    --post-threads 6
 ```
 
 | 参数 | 用途 |
 |---|---|
-| `--bvh-input prepared` | 启用双会话，一边采样当前帧，一边正式准备下一帧。配合 `--mode native` 使用。 |
+| `--host-bvh-prepacking` | 显式选择默认的原生预打包模式。也接受别名 `--defer-upload`。 |
+| `--eager-upload` | 当前帧采样时，由第二个 Cycles 会话提前准备下一帧并上传显存。 |
 | `--profile scene` / `ruins-hip256` | HIP、CUDA 和 OptiX 均可沿用场景设置。可选的 Ruins 预设会指定 RX 7800 XT 和 HIP，最多 256 采样，自适应阈值 0.01。 |
 | `--existing error` / `skip` / `replace` | 遇到已有 PNG 时退出（默认）、跳过或覆盖。 |
 
-## 实测与成片对照
+提前打包要求后台画面只有一个渲染块。启用逐批像素抖动、需要按需加载纹理瓦片，或几何需要 GPU 真置换时，引擎仍在切帧后完成相应更新。日志中的 `host_bvh_ready` 表示下一帧的包已在系统内存就绪，`bvh_pack_consumed` 表示切帧后已取用。OptiX 使用自己的加速结构构建路径。
 
-**AMD HIP。** Ruins 基准按原顺序连续渲染第 624–633 帧，1920×1080、RX 7800 XT、普通 HIP、持久化数据、最多 256 个自适应采样，阈值 0.01，CPU OIDN 六线程。官方 Blender 与流水线各完整渲染一次。
+<!-- benchmark-measurements:begin -->
 
-![连续十帧的实测耗时、GPU 利用率和专用显存峰值](benchmarks/overview-zh.png)
+<a id="实测与成片对照"></a>
 
-| 指标 | 官方 Blender | 发布版 |
+## 渲染性能基准
+
+官方 Blender 和 v0.5.0 默认配置各用一张 Radeon RX 7800 XT，按原顺序渲染 Ruins 第 624–633 帧。两组均使用 HIP、1920 × 1080、持久化数据，最多 256 个自适应采样，阈值为 0.01。
+
+| 指标 | 官方 Blender | v0.5.0 默认设置 |
 |---|---:|---:|
-| 启动到首张 PNG 写完 | 189.14 秒 | 208.31 秒 |
-| 启动到末张 PNG 写完 | 560.25 秒 | **466.03 秒** |
-| 后九帧平均出图间隔 | 41.23 秒 | **28.64 秒** |
-| 首张 PNG 写完后的平均 GPU 利用率 | 69.91% | **94.85%** |
-| 首张 PNG 写完后 GPU 利用率低于 10% 的时长 | 81.82 秒 | **3.00 秒** |
-| 专用显存峰值 | 8.62 GiB | **12.29 GiB** |
-| 系统提交内存峰值 | 73.10 GiB | **85.21 GiB** |
+| 启动到首张 PNG 写完 | 193.164 秒 | 200.398 秒 |
+| 启动到末张 PNG 写完 | 576.072 秒 | **472.271 秒** |
+| 相邻 PNG 平均出图间隔 | 42.545 秒 | **30.208 秒** |
+| 首张至末张 PNG 之间的平均 GPU 利用率 | 71.39% | 91.52% |
+| 同期 GPU 利用率低于 10% 的时长 | 3.007 秒 | 10.267 秒 |
+| 专用显存峰值 | 8.53 GiB | 8.46 GiB |
+| 整机物理内存使用峰值 | 31.95 GiB | 31.95 GiB |
+| 系统提交内存峰值 | 73.89 GiB | 76.31 GiB |
 
-从启动到末张 PNG 写完，流水线比官方 Blender 节省 **94.22 秒（16.82%）**。九次切帧时，下一帧都在当前帧最后一批 GPU 采样结束前准备就绪。相邻两帧采样之间的间隔中位数为 **0.139 秒**。GPU 利用率约每秒采样一次，统计整张卡。系统提交内存可由物理内存或 Windows 页面文件承载，两组实测的物理内存使用峰值均为 31.95 GiB。
+![连续十帧的实测耗时、GPU 利用率和内存占用](benchmarks/overview-zh.png)
 
-**画面对照。** 解码十对 PNG 后，共 20,736,000 个像素，其中 5,343 个像素的 RGB 与官方成片相差 1 个 8 位色阶，其余像素的 RGB 和全部 alpha 完全一致。两个会话交接时会继承同一份环境光重要性采样表，世界材质变化时重新计算。另用正式发行程序渲染四帧动画，在第 3 帧改变世界亮度，四张 RGBA 与官方均逐像素一致。
+在九次切帧中，Cycles 都在 GPU 采样上一帧期间完成了下一帧 BVH 的预打包，并将结果留在系统内存。相邻两帧 GPU 采样之间的间隔中位数为 **1.472 秒**。完整报告包含逐秒曲线、各帧时间戳和千帧估算过程。[实测数据与方法](benchmarks/README.zh-CN.md)
 
-以上 AMD 数据来自已记录的 HIP 十帧实测。另用本次 Windows 多后端引擎在 RX 7800 XT 上渲染三帧回归场景，RGBA 与官方逐像素相同。Ruins 生产场景为私有素材。仓库提供实测数据、图表重绘脚本和用于验证画面的程序化小场景。[AMD 基准数据、逐秒曲线与测量方法](benchmarks/README.zh-CN.md)
+<!-- benchmark-measurements:end -->
 
-**NVIDIA CUDA 和 OptiX。** 在 RTX 3090 上，两种后端均完成了三帧回归动画，实际运行了下一帧的提前准备和 CPU 帧尾处理，并对照了同后端官方 Blender 的 PNG 像素。在 Ruins 原工程上，官方 CUDA 完成了整段序列，CUDA 并行准备模式输出若干帧后触及 Windows 系统提交内存上限。此类大场景除了要留出显存，还需要足够的物理内存和页面文件容量。上表的公开耗时与吞吐数据适用于 RX 7800 XT。
+**NVIDIA CUDA 和 OptiX。** RTX 3090 的历史测试涵盖两种后端的三帧动画渲染。新默认模式的性能表仅使用 RX 7800 XT 的实测数据。
 
 ## 从源码构建并验证
 

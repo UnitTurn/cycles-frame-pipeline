@@ -203,5 +203,5 @@ foreach ($pattern in 'kernel_gfx*.fatbin.zst','kernel_sm_*.cubin.zst','kernel_co
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'OptiX-NOTICE.md') -Destination (Join-Path $install 'license/others/NVIDIA-OptiX.md')
 Invoke-Checked (Join-Path $install 'blender.exe') @('-b','--factory-startup','--python-exit-code','1',
-    '--python-expr','import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and callable(_cycles.formal_begin)')
+    '--python-expr','import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and _cycles.with_host_bvh_packing and callable(_cycles.formal_resume_native)')
 Write-Output "Backend ready: $install\blender.exe"

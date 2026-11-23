@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 from string import Formatter
+import sys
 import tomllib
 import zipfile
 
@@ -15,9 +16,11 @@ manifest_text = manifest.read_text(encoding="utf8")
 metadata = tomllib.loads(manifest_text)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--locale", choices=("en", "zh-CN"), help="build one UI language (default: both)")
+parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
+parser.add_argument("--extension-only", action="store_true", help="omit the source archive")
 args = parser.parse_args()
-dist = ROOT / "dist"
-dist.mkdir(exist_ok=True)
+dist = args.output_dir
+dist.mkdir(parents=True, exist_ok=True)
 files = {manifest.with_name("__init__.py"): "__init__.py", ROOT / "COPYING": "COPYING"}
 for path in sorted((ROOT / "pipeline").glob("*.py")):
     files[path] = f"pipeline/{path.name}"
@@ -57,6 +60,9 @@ for locale in ([args.locale] if args.locale else catalogs):
             archive.writestr(entry, data, compress_type=zipfile.ZIP_DEFLATED)
     target.with_suffix(".tmp").replace(target)
     print(target)
+
+if args.extension_only:
+    sys.exit(0)
 
 source_zip = dist / f"{metadata['id']}-source-{metadata['version']}.zip"
 with zipfile.ZipFile(source_zip.with_suffix(".tmp"), "w", compression=zipfile.ZIP_DEFLATED) as archive:

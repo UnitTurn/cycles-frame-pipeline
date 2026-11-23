@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -117,7 +118,17 @@ def make_scene(path, all_samples, prepared=False):
     bpy.ops.wm.save_as_mainfile(filepath=str(path))
 
 
-def run(official, backend, output, all_samples, fixture, prepared=False):
+def configure_dynamic_fallback():
+    import bpy
+    bpy.context.scene.render.use_motion_blur = False
+
+    def change_denoising(scene, depsgraph):
+        scene.cycles.use_denoising = scene.frame_current != 2
+
+    bpy.app.handlers.frame_change_post.append(change_denoising)
+
+
+def run(official, backend, output, all_samples, fixture, prepared=False, dynamic_fallback=False):
     import numpy as np
     from PIL import Image
     output.mkdir(parents=True, exist_ok=False)
@@ -134,16 +145,27 @@ def run(official, backend, output, all_samples, fixture, prepared=False):
     else:
         scene = output / 'reflectors.blend'
         blender('create', official, '--factory-startup', '--python-exit-code', '9', '-P', __file__, '--',
-                scene, *(['--all-samples'] if all_samples else []), *(['--prepared'] if prepared else []))
+                scene, *(['--all-samples'] if all_samples else []),
+                *(['--prepared'] if prepared or dynamic_fallback else []))
     entry = HERE.parents[1] / 'pipeline/render.py'
     candidate_bvh = 'prepared' if prepared else 'next'
-    for label, exe, mode, bvh in [('official',official,'serial','off'), ('candidate',backend,'native',candidate_bvh)]:
-        report = blender(label, exe, scene, '-t', 4, '--python-exit-code', 9, '-P', entry, '--',
+    setup = []
+    candidate_options = ['--mode', 'native', '--bvh-input', candidate_bvh, '--fallback', 'error']
+    if dynamic_fallback:
+        setup = ['--python-expr', f'import runpy; runpy.run_path({str(Path(__file__).resolve())!r})["configure_dynamic_fallback"]()']
+        candidate_options = []  # Exercise the default native path and its automatic fallback.
+    for label, exe, options in [('official', official, ['--mode', 'serial', '--bvh-input', 'off']),
+                                ('candidate', backend, candidate_options)]:
+        report = blender(label, exe, scene, '-t', 4, '--python-exit-code', 9, *setup, '-P', entry, '--',
                          '--profile', 'ruins-hip256', '--post-threads', 4, '--output', output/label,
-                         '--mode', mode, '--bvh-input', bvh, '--fallback', 'error')
+                         *options)
         if label == 'candidate':
             assert 'PIPELINE_MODE async native' in report, report
-            if prepared:
+            if dynamic_fallback:
+                assert 'READYFRAME frame=1 event=sample_begin ' in report, report
+                assert 'PIPELINE_MODE serial frame 2' in report, report
+                assert re.findall(r'PIPELINE_FRAME_DONE (\d+)', report) == ['1','2','3'], report
+            elif prepared:
                 for frame in range(1, 4):
                     for stage in ('scene_eval', 'bvh_packed', 'prepared', 'sample_begin'):
                         assert report.count(f'READYFRAME frame={frame} event={stage} ') == 1, report
@@ -175,8 +197,11 @@ if __name__ == '__main__':
         source = p.add_mutually_exclusive_group()
         source.add_argument('--all-samples', action='store_true', help='stress run using the full 256-sample adaptive job')
         source.add_argument('--scene', type=Path, help='use reflectors.blend saved by an earlier run')
-        p.add_argument('--prepared', action='store_true',
-                       help='check formal frame handoff with a camera-dependent World shader')
+        mode = p.add_mutually_exclusive_group()
+        mode.add_argument('--prepared', action='store_true',
+                          help='check formal frame handoff with a camera-dependent World shader')
+        mode.add_argument('--dynamic-fallback', action='store_true',
+                          help='toggle denoising between frames and compare persistent World lighting and PNG order')
         opt = p.parse_args()
         run(opt.official.resolve(), opt.backend.resolve(), opt.output.resolve(), opt.all_samples,
-            opt.scene, opt.prepared)
+            opt.scene, opt.prepared, opt.dynamic_fallback)

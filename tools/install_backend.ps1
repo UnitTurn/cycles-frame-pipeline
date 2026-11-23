@@ -61,7 +61,7 @@ try {
     Copy-Item -LiteralPath $binary -Destination $stagedExe
     Copy-Item -LiteralPath $messagesFile -Destination (Join-Path $staging 'install-messages.psd1')
     Copy-Item -LiteralPath $launcher -Destination (Join-Path $staging 'open_blender.ps1')
-    & $stagedExe -b --factory-startup --disable-autoexec --python-exit-code 1 --python-expr 'import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and callable(_cycles.formal_begin)' | Out-Null
+    & $stagedExe -b --factory-startup --disable-autoexec --python-exit-code 1 --python-expr 'import _cycles; assert _cycles.with_host_bvh_packing and _cycles.with_native_frame_post and callable(_cycles.formal_resume_native)' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw $messages.Load }
     if ([IO.Path]::GetDirectoryName($staging) -ne $parentDir -or [IO.Path]::GetDirectoryName($target) -ne $parentDir) {
         throw $messages.Location
