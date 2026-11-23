@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
@@ -10,43 +11,44 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty, 
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 
 
+_directory = Path(__file__).parent
+_catalog = _directory / 'ui.json'
+if not _catalog.exists():
+    # A source checkout uses the original language. Each release ZIP contains its chosen catalog.
+    _catalog = _directory / 'locales' / 'zh-CN.json'
+UI = json.loads(_catalog.read_text(encoding='utf-8'))
+UI_CONTEXT = 'CyclesFramePipeline'
+
+
+def _label(key):
+    return {'name': UI[key], 'description': UI[key + '.tip'], 'translation_context': UI_CONTEXT}
+
+
+def _option(identifier, key=None):
+    key = key or identifier
+    return (identifier, UI[key], UI[key + '.tip'])
+
+
 class FramePipelinePreferences(AddonPreferences):
     bl_idname = __package__
-    backend: StringProperty(name="定制 Blender 程序", subtype='FILE_PATH')
+    backend: StringProperty(**_label('backend'), subtype='FILE_PATH')
 
     def draw(self, context):
-        self.layout.prop(self, "backend")
+        self.layout.prop(self, 'backend')
 
 
 class FramePipelineSettings(PropertyGroup):
-    source: EnumProperty(name="场景来源", items=[
-        ('current', '当前场景', ''),
-        ('file', '从磁盘选择 .blend', '可从空场景启动，减少前台 Blender 的内存占用'),
-    ])
-    scene_file: StringProperty(name="场景文件", subtype='FILE_PATH')
-    profile: EnumProperty(name="渲染设置", items=[
-        ('scene', '使用场景设置', ''),
-        ('ruins-hip256', 'Ruins 最终渲染 · RX 7800 XT', 'HIP、256 采样、自适应阈值 0.01、CPU OIDN、持久化数据'),
-    ])
-    output: StringProperty(name="PNG 输出目录", subtype='DIR_PATH', default="//流水线输出/")
-    mode: EnumProperty(name="帧尾处理", items=[
-        ('native', 'Cycles 原生降噪与输出', '配套引擎可与下一帧并行；官方 Blender 串行输出'),
-        ('serial', 'Cycles 原生同步输出', '可独立验证提前建树，并与相同引擎同步出图对照'),
-        ('compositor', '合成器降噪（旧版）', '使用独立合成器降噪，成片可能与原作业有差异'),
-    ], default='native')
-    lookahead: BoolProperty(name="优化原版 BVH（配套引擎）", default=False)
-    bvh_input: EnumProperty(name="BVH 输入", items=[
-        ('auto', '按渲染预设选择', 'Ruins 优先复用上一帧原版树，其他场景提前求值下一帧'),
-        ('next', '提前求值下一帧', 'GPU 采样当前帧期间构建下一帧的原版树'),
-        ('previous', '复用上一帧相同的子树', '每帧只求值一次，变化的区域按原版构建'),
-        ('prepared', '并行准备下一正式帧', 'GPU 采样时求值下一帧，完成原生 BVH 校验和打包'),
-    ], default='auto')
-    threads: IntProperty(name="降噪线程数", default=6, min=1, max=128)
-    existing: EnumProperty(name="已有 PNG", items=[
-        ('error', '遇到已有帧时退出', ''),
-        ('skip', '跳过已有帧', ''),
-        ('replace', '覆盖已有帧', ''),
-    ])
+    source: EnumProperty(**_label('source'), items=[_option('current'), _option('file')])
+    scene_file: StringProperty(**_label('scene_file'), subtype='FILE_PATH')
+    profile: EnumProperty(**_label('profile'), items=[_option('scene'), _option('ruins-hip256', 'ruins')])
+    output: StringProperty(**_label('output'), subtype='DIR_PATH', default=UI['output.default'])
+    mode: EnumProperty(**_label('mode'), items=[_option('native'), _option('serial'), _option('compositor')],
+                       default='native')
+    lookahead: BoolProperty(**_label('lookahead'), default=False)
+    bvh_input: EnumProperty(**_label('bvh_input'), items=[_option('auto'), _option('next'),
+                            _option('previous'), _option('prepared')], default='auto')
+    threads: IntProperty(**_label('threads'), default=6, min=1, max=128)
+    existing: EnumProperty(**_label('existing'), items=[_option('error'), _option('skip'), _option('replace')])
 
 
 _active = None
@@ -115,13 +117,13 @@ def _poll():
         if job['snapshot']:
             job['snapshot'].unlink(missing_ok=True)
         if code:
-            state = f"任务退出（{code}），请查看日志"
+            state = UI['status.exit'].format(code=code)
         elif job['done'] + job['skipped'] == job['total']:
-            state = f"已输出 {job['done']} 帧，跳过 {job['skipped']} 帧"
+            state = UI['status.complete'].format(**job)
         elif job['stop'].exists():
-            state = f"已停止，完成 {job['done']} 帧"
+            state = UI['status.stop'].format(**job)
         else:
-            state = f"进程已退出，仅确认 {job['done']} / {job['total']} 帧"
+            state = UI['status.incomplete'].format(done=job['done'], total=job['total'] if job['total'] is not None else '…')
         _last = {'state': state, 'log': str(job['log']), 'fallback': job.get('fallback', ''),
                  'lookahead': job['lookahead'], 'bvh_hits': job['bvh_hits'],
                  'bvh_partial': job['bvh_partial'], 'bvh_partial_detail': job.get('bvh_partial_detail'),
@@ -133,13 +135,14 @@ def _poll():
 
 class FRAMEPIPE_OT_start(Operator):
     bl_idname = 'render.frame_pipeline_start'
-    bl_label = '启动流水线渲染'
-    bl_description = '后台渲染场景帧范围，并在 PNG 写好之后报告该帧完成'
+    bl_translation_context = UI_CONTEXT
+    bl_label = UI['start']
+    bl_description = UI['start.tip']
 
     def execute(self, context):
         global _active, _last
         if _active:
-            self.report({'ERROR'}, '已有流水线任务在运行')
+            self.report({'ERROR'}, UI['err.active'])
             return {'CANCELLED'}
         scene = context.scene
         cfg = context.window_manager.frame_pipeline
@@ -147,31 +150,31 @@ class FRAMEPIPE_OT_start(Operator):
         snapshot = None
         try:
             if not external and scene.render.engine != 'CYCLES':
-                raise ValueError('请先将场景渲染引擎设为 Cycles')
+                raise ValueError(UI['err.cycles'])
             if not external and scene.frame_end < scene.frame_start:
-                raise ValueError('结束帧早于起始帧')
+                raise ValueError(UI['err.range'])
             exe = Path(bpy.app.binary_path)
             if cfg.lookahead and cfg.bvh_input == 'prepared' and cfg.mode != 'native':
-                raise ValueError('并行准备正式帧需要选择“Cycles 原生降噪与输出”')
+                raise ValueError(UI['err.mode'])
             backend = context.preferences.addons[__package__].preferences.backend
             if cfg.lookahead and not backend:
                 import _cycles
                 if not getattr(_cycles, 'with_exact_bvh', False):
-                    raise ValueError('请先在插件偏好设置中选择配套的 Blender 程序')
+                    raise ValueError(UI['err.backend'])
             if backend and (cfg.lookahead or cfg.mode != 'compositor'):
                 exe = Path(bpy.path.abspath(backend))
             if not exe.is_file():
-                raise ValueError('找不到选定的 Blender 可执行文件')
+                raise ValueError(UI['err.exe'])
             if not cfg.output.strip():
-                raise ValueError('请选择 PNG 输出目录')
+                raise ValueError(UI['err.output'])
             if external:
                 if not cfg.scene_file.strip():
-                    raise ValueError('请选择需要渲染的 .blend 文件')
+                    raise ValueError(UI['err.input'])
                 source_path = Path(bpy.path.abspath(cfg.scene_file)).resolve()
                 if not source_path.is_file() or source_path.suffix.lower() != '.blend':
-                    raise ValueError('找不到选定的 .blend 文件')
+                    raise ValueError(UI['err.file'])
             elif not bpy.data.filepath and cfg.output.startswith('//'):
-                raise ValueError('未保存的场景需要选择绝对输出目录')
+                raise ValueError(UI['err.unsaved'])
             if external and cfg.output.startswith('//'):
                 output = (source_path.parent / cfg.output[2:]).resolve()
             else:
@@ -186,11 +189,11 @@ class FRAMEPIPE_OT_start(Operator):
                 snapshot = run / 'scene.blend'
                 result = bpy.ops.wm.save_as_mainfile(filepath=str(snapshot), copy=True, relative_remap=True)
                 if 'FINISHED' not in result:
-                    raise RuntimeError('无法为当前更改创建渲染副本')
+                    raise RuntimeError(UI['err.snapshot'])
                 scene_file = str(snapshot)
             entry = Path(__file__).parent / 'pipeline' / 'render.py'
             if not entry.is_file():
-                raise RuntimeError('安装包缺少流水线入口，请使用完整插件 ZIP')
+                raise RuntimeError(UI['err.entry'])
             args = [str(exe), '-b', scene_file]
             if not external:
                 args += ['-S', scene.name]
@@ -209,7 +212,8 @@ class FRAMEPIPE_OT_start(Operator):
         except (OSError, ValueError, RuntimeError) as exc:
             if snapshot:
                 snapshot.unlink(missing_ok=True)
-            self.report({'ERROR'}, str(exc))
+            message = UI['err.io'].format(detail=exc) if isinstance(exc, OSError) else str(exc)
+            self.report({'ERROR'}, message)
             return {'CANCELLED'}
         _active = {'proc': child, 'log': log_path, 'stop': stop, 'snapshot': snapshot,
                    'frame': '', 'done': 0, 'total': None if external else len(range(scene.frame_start, scene.frame_end + 1, scene.frame_step)),
@@ -223,21 +227,25 @@ class FRAMEPIPE_OT_start(Operator):
 
 class FRAMEPIPE_OT_stop(Operator):
     bl_idname = 'render.frame_pipeline_stop'
-    bl_label = '完成在途帧后停止'
+    bl_translation_context = UI_CONTEXT
+    bl_label = UI['stop']
+    bl_description = UI['stop.tip']
 
     def execute(self, context):
         if _active:
             try:
                 _active['stop'].touch()
             except OSError as exc:
-                self.report({'ERROR'}, str(exc))
+                self.report({'ERROR'}, UI['err.io'].format(detail=exc))
                 return {'CANCELLED'}
         return {'FINISHED'}
 
 
 class FRAMEPIPE_OT_log(Operator):
     bl_idname = 'render.frame_pipeline_log'
-    bl_label = '打开任务日志'
+    bl_translation_context = UI_CONTEXT
+    bl_label = UI['log']
+    bl_description = UI['log.tip']
 
     def execute(self, context):
         job = _active or _last
@@ -247,7 +255,8 @@ class FRAMEPIPE_OT_log(Operator):
 
 
 class FRAMEPIPE_PT_render(Panel):
-    bl_label = 'Cycles 帧间流水线'
+    bl_translation_context = UI_CONTEXT
+    bl_label = UI['manifest.name']
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = 'render'
@@ -277,24 +286,27 @@ class FRAMEPIPE_PT_render(Panel):
         group.operator(FRAMEPIPE_OT_start.bl_idname, icon='RENDER_ANIMATION')
         if _active:
             job = _active
-            ui.label(text=f"已输出 {job['done']} / {job['total'] or '…'} 帧" + (f" · 正在渲染 {job['frame']}" if job['frame'] else ''))
+            status = UI['status.active'].format(done=job['done'], total=job['total'] if job['total'] is not None else '…')
+            if job['frame']:
+                status += ' · ' + UI['status.frame'].format(frame=job['frame'])
+            ui.label(text=status, translate=False)
             row = ui.row()
             row.enabled = not job['stop'].exists()
             row.operator(FRAMEPIPE_OT_stop.bl_idname, icon='CANCEL')
         elif _last:
-            ui.label(text=_last['state'])
+            ui.label(text=_last['state'], translate=False)
         if _active or _last:
             job = _active or _last
             if job.get('lookahead'):
-                msg = f"BVH 整树复用 {job['bvh_hits'] - job['bvh_partial']} 次，部分复用 {job['bvh_partial']} 次"
+                msg = UI['status.bvh'].format(whole=job['bvh_hits'] - job['bvh_partial'], partial=job['bvh_partial'])
                 if job.get('bvh_last_miss'):
-                    msg += f" · 最近回退 {job['bvh_last_miss']}"
-                ui.label(text=msg)
+                    msg += ' · ' + UI['status.miss'].format(reason=UI.get('miss.' + job['bvh_last_miss'], job['bvh_last_miss']))
+                ui.label(text=msg, translate=False)
                 if job.get('bvh_partial_detail'):
                     refs, total, branches = job['bvh_partial_detail']
-                    ui.label(text=f"最近部分复用 {branches} 个分支，{refs:,} / {total:,} 条引用")
+                    ui.label(text=UI['status.refs'].format(branches=branches, refs=refs, total=total), translate=False)
             if job.get('fallback'):
-                ui.label(text="部分设置使用原生渲染，详见日志", icon='INFO')
+                ui.label(text=UI['status.fallback'], icon='INFO', translate=False)
             ui.operator(FRAMEPIPE_OT_log.bl_idname, icon='TEXT')
 
 

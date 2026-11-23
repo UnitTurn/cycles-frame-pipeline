@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Stage one tested Windows release asset without adding binaries to the source tree."""
+"""Stage the two localized Windows overlays without adding binaries to the source tree."""
 import hashlib
 from pathlib import Path
 import subprocess
@@ -20,19 +20,22 @@ def main():
     manifest = tomllib.loads((ROOT / "extension/blender_manifest.toml").read_text(encoding="utf-8"))
     version = manifest["version"]
     tag = f"v{version}"
-    asset = ROOT / "dist" / f"cycles-frame-pipeline-windows-x64-{version}.zip"
-    with asset.open("rb") as f:
-        digest = hashlib.file_digest(f, "sha256").hexdigest()
-    blob = git("hash-object", "-w", "--", str(asset))
+    entries, checksums = [], []
+    for language in ("en", "zh-CN"):
+        asset = ROOT / "dist" / f"cycles-frame-pipeline-windows-x64-{version}-{language}.zip"
+        with asset.open("rb") as file:
+            digest = hashlib.file_digest(file, "sha256").hexdigest()
+        blob = git("hash-object", "-w", "--", str(asset))
+        entries.append(f"100644 blob {blob}\t{asset.name}\0")
+        checksums.append(f"{digest}  {asset.name}\n")
     local_ref = f"refs/cycles-frame-pipeline/release-input/{tag}"
-    tree = git("mktree", "-z", data=f"100644 blob {blob}\t{asset.name}\0".encode("ascii"))
+    tree = git("mktree", "-z", data="".join(entries).encode("ascii"))
     previous = subprocess.run(["git", "rev-parse", "--verify", "--quiet", local_ref], cwd=ROOT,
                               stdout=subprocess.PIPE)
     parents = ["-p", previous.stdout.decode("ascii").strip()] if previous.returncode == 0 else []
     commit = git("commit-tree", tree, *parents, "-m", f"Stage tested Windows overlay for {tag}")
     git("update-ref", local_ref, commit)
-    (ROOT / "release/windows-overlay.sha256").write_bytes(
-        f"{digest}  {asset.name}\n".encode("ascii"))
+    (ROOT / "release/windows-overlay.sha256").write_bytes("".join(checksums).encode("ascii"))
     print(f"git push origin {local_ref}:refs/heads/release-input/{tag}")
     print("Commit release/windows-overlay.sha256 on main before pushing the version tag.")
 

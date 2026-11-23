@@ -4,9 +4,16 @@ English · [简体中文](README.zh-CN.md)
 
 Render consecutive Blender animation frames on one GPU. While Cycles samples frame **N**, Blender evaluates frame **N+1** and a second Cycles session validates its BVH, packs the scene and uploads it to the GPU. At the frame boundary that same session starts sampling. A CPU worker denoises and writes finished frames as numbered PNGs.
 
-On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **560.25 s to 466.03 s** on a Radeon RX 7800 XT. Average GPU utilization after the first PNG rose from **69.91% to 94.85%**. Peak dedicated GPU memory rose from **8.62 GiB to 12.29 GiB**.
+**1,000-frame estimate on a Radeon RX 7800 XT.** If a 1080p animation sustains the throughput measured on Ruins frames 624–633, the pipeline would save about **3 h 29 min 26 s**. Both percentages use the time from launch to final PNG and the same denominator, official Blender’s wall time. The calculation is `(official time − pipeline time) / official time`.
 
-![Ten-frame render time, GPU utilization and peak memory for stock Blender and Cycles Frame Pipeline 0.3.0](benchmarks/overview-en.png)
+| Sequence | Official Blender | Cycles Frame Pipeline | Time reduction |
+|---|---:|---:|---:|
+| 10 frames · measured | 560.25 s | 466.03 s | **16.82%** |
+| 1,000 frames · projected | 11 h 29 min 41 s | 8 h 00 min 15 s | **30.37%** |
+
+![Measured time reduction across ten frames and projected time reduction across 1,000 frames on the RX 7800 XT](benchmarks/projection-en.png)
+
+The estimate counts startup once and uses the mean of the nine measured intervals for the remaining frames. The formula is `first PNG + 999 × ((tenth PNG − first PNG) / 9)`. Times are seconds from launch. The input pairs were 189.144 and 560.246 for official Blender, and 208.306 and 466.027 for Cycles Frame Pipeline. Shots with different geometry or sampling costs will have different frame intervals.
 
 [Install](#install) · [Render an animation](#render-an-animation) · [Benchmark and image quality](#benchmark-and-image-quality) · [Build and test](#build-and-test)
 
@@ -19,26 +26,35 @@ On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **56
 ## Install
 
 1. Install the official **Blender 5.2.1 LTS Windows x64** build. The installer checks the build hash because the patched executable uses the matching Blender runtime and HIP kernels.
-2. Download the Windows engine overlay and `cycles_frame_pipeline-0.3.0.zip` from the [latest release](https://github.com/expitau-one/cycles-frame-pipeline/releases/latest). Extract the engine overlay. From the source checkout, run the following in PowerShell, substituting the path to the extracted executable and your official installation. Choose a new destination directory for the side-by-side runtime. The overlay also includes the installation script.
+2. For the English interface, download `cycles-frame-pipeline-windows-x64-0.3.1-en.zip` (Windows engine overlay and English installer) and `cycles_frame_pipeline-0.3.1-en.zip` (extension) from the [latest release](https://github.com/expitau-one/cycles-frame-pipeline/releases/latest). The Chinese distribution has the same extension ID and engine. Install one language edition. Extract the engine overlay to `.\downloads\engine` for the paths below. From your working directory, run the included English installer in PowerShell. Adjust the official installation path and choose a new destination directory for the side-by-side runtime.
 
    ```powershell
-   .\tools\install_backend.ps1 `
+   .\downloads\engine\install_backend.ps1 `
        -PatchedExe '.\downloads\engine\blender.exe' `
        -BlenderInstall 'C:\Program Files\Blender Foundation\Blender 5.2' `
        -Destination '.\backend'
    ```
 
-3. In Blender, open **Edit → Preferences → Get Extensions → menu → Install from Disk**, select the extension ZIP and enable **Cycles 帧间流水线**. If submitting from official Blender, set **定制 Blender 程序** (custom Blender executable) to the new `backend\blender.exe`. Running the patched Blender directly also works. The command-line workflow below requires the repository scripts and the backend.
+3. Open the English Blender window using the launcher installed with the backend.
+
+   ```powershell
+   .\backend\open_blender.ps1
+   ```
+
+4. **In that window**, open **Edit → Preferences → Get Extensions → menu → Install from Disk**, select `cycles_frame_pipeline-0.3.1-en.zip` and choose the default user repository. Enable **Cycles Frame Pipeline**. Use the same launcher next time. It keeps this edition's preferences and default extensions under `%LOCALAPPDATA%\CyclesFramePipeline\5.2\en_US`. On first launch, it imports the existing startup settings and default user extensions.
+
+**Using your regular Blender profile.** Starting `backend\blender.exe` directly follows your normal Blender language and preferences. To submit from an official Blender installation, install the English extension in that window and set **Custom Blender Executable** to the patched `backend\blender.exe`. The CLI workflow below uses the repository scripts and the backend.
+
 
 ## Render an animation
 
-**Blender UI.** In **Render Properties → Cycles 帧间流水线**, select the current scene or a saved `.blend`, set a PNG output directory and choose **Cycles 原生降噪与输出** (native denoising and output). Enable **优化原版 BVH（配套引擎）**, select **并行准备下一正式帧** (prepare the next frame), then click **启动流水线渲染**. Progress counts completed PNGs. For a large scene, an empty Blender window can submit a `.blend` from disk.
+**Blender UI.** In **Render Properties → Cycles Frame Pipeline**, select the current scene or a saved `.blend`, set a PNG output directory and choose **Native Cycles Denoising and Output**. Enable **Optimize Native BVH (Custom Engine)**, select **Prepare Next Frame in Parallel**, then click **Start Pipeline Render**. For the 1,000-frame example, set the scene’s frame range to 1–1000 with a step of 1. Progress counts completed PNGs. For a large scene, an empty Blender window can submit a `.blend` from disk.
 
-**Command line.** From the repository root, replace `.\scene.blend` with your scene. This example uses the scene's saved render settings and writes `0001.png` through `0010.png`. Select the HIP render device in Blender for GPU rendering.
+**Command line.** From the repository root, replace `.\scene.blend` with your scene. This example uses the scene's saved render settings and writes `0001.png` through `1000.png`. Select the HIP render device in Blender for GPU rendering.
 
 ```powershell
 & .\backend\blender.exe -b '.\scene.blend' --python-exit-code 9 -P .\pipeline\render.py -- `
-    --output '.\renders' --start 1 --end 10 --step 1 `
+    --output '.\renders' --start 1 --end 1000 --step 1 `
     --profile scene --mode native --bvh-input prepared --post-threads 6
 ```
 
@@ -50,9 +66,11 @@ On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **56
 
 ## Benchmark and image quality
 
-**Ruins**, frames 624–633 in order, 1920×1080, RX 7800 XT, standard HIP, persistent data, up to 256 adaptive samples, threshold 0.01 and six CPU OIDN threads. Stock Blender and the 0.3.0 pipeline each rendered the full sequence once.
+**Ruins**, frames 624–633 in order, 1920×1080, RX 7800 XT, standard HIP, persistent data, up to 256 adaptive samples, threshold 0.01 and six CPU OIDN threads. Official Blender and the pipeline each rendered these ten frames once.
 
-| Metric | Stock Blender | Cycles Frame Pipeline 0.3.0 |
+![Measured performance, GPU utilization and peak GPU memory for the ten-frame run](benchmarks/overview-en.png)
+
+| Metric | Official Blender | Cycles Frame Pipeline |
 |---|---:|---:|
 | Launch to first PNG | 189.14 s | 208.31 s |
 | Launch to final PNG | 560.25 s | **466.03 s** |
@@ -62,11 +80,11 @@ On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **56
 | Peak dedicated GPU memory | 8.62 GiB | **12.29 GiB** |
 | Peak system committed memory | 73.10 GiB | **85.21 GiB** |
 
-The 0.3.0 pipeline saved **94.22 s (16.82%)** over stock Blender from launch to the final PNG. At all nine frame transitions, preparation finished before the GPU completed its last sampling batch on the active frame. The median gap between successive sampling windows was **0.139 s**. GPU activity is whole-card utilization sampled at about 1 Hz. System commit includes memory backed by RAM or the Windows page file. Peak physical memory was 31.95 GiB in both runs.
+The pipeline saved **94.22 s (16.82%)** over stock Blender from launch to the final PNG. At all nine frame transitions, preparation finished before the GPU completed its last sampling batch on the active frame. The median gap between successive sampling windows was **0.139 s**. GPU activity is whole-card utilization sampled at about 1 Hz. System commit includes memory backed by RAM or the Windows page file. Peak physical memory was 31.95 GiB in both runs.
 
 **Image comparison.** Across ten decoded PNG pairs, 5,343 of 20,736,000 pixels differed from stock Blender by one 8-bit RGB level. All other RGB values and all alpha values matched. The two sessions inherit the same cached environment-light sampling distribution and update it when the world changes. A separate four-frame test of the release executable changed world intensity in frame 3. All four RGBA outputs matched stock pixel for pixel.
 
-The production scene is private. The repository includes the measurements, a script to regenerate the charts and a procedural scene for testing image parity. The release executable adds two configuration checks before inheriting the environment sampling distribution. The benchmark configuration was constant. [Benchmark data, time series and methodology](benchmarks/README.md)
+The production scene is private. The repository includes the measurements, a script to regenerate the charts and a procedural scene for testing image parity. The English and Simplified Chinese packages ship the same Windows rendering executable. The release engine adds two configuration checks before reusing the environment sampling distribution compared with the ten-frame timing build. The benchmark configuration was constant. [Benchmark data, time series and methodology](benchmarks/README.md)
 
 ## Build and test
 
@@ -78,7 +96,7 @@ To build the backend from source, use Python 3.11+, Git with Git LFS, CMake, Nin
 python tools/package.py
 ```
 
-The extension ZIP is written to `dist/`. Without `-InstallDir`, the backend installs to `work/clang-release/`. Once the source and dependencies have been fetched, `-Offline` reuses the local checkouts. [Build script](engine/build_backend.ps1) · [Cycles patch series](engine/patches)
+The language-specific extension ZIPs and shared source ZIP are written to `dist/`. Without `-InstallDir`, the backend installs to `work/clang-release/`. Once the source and dependencies have been fetched, `-Offline` reuses the local checkouts. [Build script](engine/build_backend.ps1) · [Cycles patch series](engine/patches)
 
 On an RX 7800 XT, the following test generates a small animated scene with a camera-dependent world shader, renders three frames with both engines and compares the decoded RGBA pixels. Use a new output directory.
 

@@ -12,20 +12,33 @@ param(
     [Parameter(Mandatory = $true)][string]$Destination
 )
 $ErrorActionPreference = 'Stop'
+$messagesFile = Join-Path $PSScriptRoot 'install-messages.psd1'
+$launcher = Join-Path $PSScriptRoot 'open_blender.ps1'
+if (!(Test-Path -LiteralPath $messagesFile -PathType Leaf)) {
+    $messagesFile = Join-Path $PSScriptRoot 'windows_release\en.psd1'
+    $launcher = Join-Path $PSScriptRoot 'windows_release\open_blender.ps1'
+}
+$messages = Import-PowerShellDataFile -LiteralPath $messagesFile
+if (!(Test-Path -LiteralPath (Join-Path $BlenderInstall 'blender.exe') -PathType Leaf)) {
+    throw ($messages.MissingRuntime -f $BlenderInstall)
+}
+if (!(Test-Path -LiteralPath $PatchedExe -PathType Leaf)) {
+    throw ($messages.MissingBinary -f $PatchedExe)
+}
 $stock = (Resolve-Path -LiteralPath $BlenderInstall).ProviderPath.TrimEnd('\')
 $binary = (Get-Item -LiteralPath $PatchedExe).FullName
 $target = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)).TrimEnd('\')
 if ((Test-Path -LiteralPath $target) -or $target.StartsWith("$stock\", [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Choose a new directory outside the official Blender installation: $target"
+    throw ($messages.Destination -f $target)
 }
 $stockExe = Join-Path $stock 'blender.exe'
 $stockVersion = & $stockExe --version
 if ($LASTEXITCODE -ne 0 -or !($stockVersion -match '9e2066aef7ef')) {
-    throw "The runtime must be from Blender 5.2.1 for Windows x64, build 9e2066aef7ef: $stock"
+    throw ($messages.Version -f $stock)
 }
 $kernels = Join-Path $stock '5.2\scripts\addons_core\cycles\lib'
 if (!(Get-ChildItem -LiteralPath $kernels -Filter 'kernel_gfx*.fatbin.zst' -File)) {
-    throw "No HIP device kernels found in $kernels"
+    throw ($messages.Kernels -f $kernels)
 }
 $parentDir = Split-Path -Parent $target
 [IO.Directory]::CreateDirectory($parentDir) | Out-Null
@@ -40,10 +53,12 @@ try {
     }
     $stagedExe = Join-Path $staging 'blender.exe'
     Copy-Item -LiteralPath $binary -Destination $stagedExe
-    & $stagedExe -b --factory-startup --disable-autoexec --python-exit-code 1 --python-expr 'import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and callable(_cycles.formal_begin)'
-    if ($LASTEXITCODE -ne 0) { throw 'The patched engine could not load its matching runtime.' }
+    Copy-Item -LiteralPath $messagesFile -Destination (Join-Path $staging 'install-messages.psd1')
+    Copy-Item -LiteralPath $launcher -Destination (Join-Path $staging 'open_blender.ps1')
+    & $stagedExe -b --factory-startup --disable-autoexec --python-exit-code 1 --python-expr 'import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and callable(_cycles.formal_begin)' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw $messages.Load }
     if ([IO.Path]::GetDirectoryName($staging) -ne $parentDir -or [IO.Path]::GetDirectoryName($target) -ne $parentDir) {
-        throw 'Unexpected installation directory.'
+        throw $messages.Location
     }
     [IO.Directory]::Move($staging, $target)
 } finally {
@@ -52,4 +67,5 @@ try {
         Remove-Item -LiteralPath $staging -Recurse -Force
     }
 }
-Write-Output "Installed: $target\blender.exe"
+Write-Output ($messages.Installed -f (Join-Path $target 'blender.exe'))
+Write-Output ($messages.Launcher -f (Join-Path $target 'open_blender.ps1'))

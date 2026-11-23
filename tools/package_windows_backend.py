@@ -59,21 +59,24 @@ def release_executable(path):
     return image
 
 
-def instructions(version, chinese):
+def instructions(version, language):
     tag = f"{REPOSITORY}/tree/v{version}"
     release = f"{REPOSITORY}/releases/tag/v{version}"
     upstream = f"https://projects.blender.org/blender/blender/src/commit/{BLENDER_REVISION}"
     commands = r"""```powershell
 .\install_backend.ps1 -PatchedExe .\blender.exe -BlenderInstall "$env:ProgramFiles\Blender Foundation\Blender 5.2" -Destination .\backend
 ```"""
-    if chinese:
+    extension = f"cycles_frame_pipeline-{version}-{language}.zip"
+    if language == "zh-CN":
         return f"""# Cycles Frame Pipeline {version} · Windows x64
 
 安装官方 Blender 5.2.1 LTS（构建 `9e2066aef7ef`），解压本包，在解压目录的 PowerShell 中运行以下命令。目标目录必须是新目录。安装器会读取本机官方运行时和 HIP 内核，创建独立的配套 Blender。
 
 {commands}
 
-从[对应版本]({release})下载 `cycles_frame_pipeline-{version}.zip`，在 Blender 偏好设置中选择「从磁盘安装」。在插件偏好设置中将「定制 Blender 程序」指向新建的 `backend\\blender.exe`。
+运行 `.\\backend\\open_blender.ps1` 启动简体中文 Blender。在「编辑 → 偏好设置 → 获取扩展 → 菜单 → 从磁盘安装」中选择从[对应版本]({release})下载的 `{extension}`，使用默认用户扩展仓库并启用插件。
+
+启动器首次运行时复制现有 Blender 启动文件、偏好与默认用户扩展到 `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\zh_HANS`。以后的启动会继续使用这个中文配置。直接运行 `backend\\blender.exe` 使用常规 Blender 配置。从官方 Blender 提交作业时，可在插件偏好设置中将「定制 Blender 程序」指向新建的 `backend\\blender.exe`。
 
 [中文说明与构建步骤]({tag}/README.zh-CN.md) · [本版本完整工程源码及补丁]({tag}) · [对应 Blender 上游源码]({upstream})
 
@@ -85,7 +88,9 @@ Install official Blender 5.2.1 LTS (build `9e2066aef7ef`). Extract this archive,
 
 {commands}
 
-Download `cycles_frame_pipeline-{version}.zip` from the [matching release]({release}) and use **Install from Disk** in Blender's extension preferences. Point the extension's custom Blender executable preference to the new `backend\\blender.exe`.
+Run `.\\backend\\open_blender.ps1` to launch Blender in English. Download `{extension}` from the [matching release]({release}). Choose **Edit → Preferences → Get Extensions → menu → Install from Disk**, install into the default user repository and enable the extension.
+
+On first launch, the launcher copies your existing Blender startup file, preferences and default user extension repositories to `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\en_US`. Future launches reuse this English profile. Starting `backend\\blender.exe` directly uses the regular Blender profile. To submit jobs from official Blender, point the extension's custom Blender executable preference to the new `backend\\blender.exe`.
 
 [English manual and build instructions]({tag}/README.md) · [Release project source and patches]({tag}) · [Corresponding upstream Blender source]({upstream})
 
@@ -104,9 +109,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("patched_exe", type=Path)
     parser.add_argument("official_install", type=Path)
-    parser.add_argument("output_zip", type=Path)
+    parser.add_argument("output_zip", type=Path, nargs="?",
+                        help="default: dist/cycles-frame-pipeline-windows-x64-VERSION-LANGUAGE.zip")
+    parser.add_argument("--language", choices=("en", "zh-CN"), required=True)
     args = parser.parse_args()
     version = tomllib.loads((ROOT/"extension/blender_manifest.toml").read_text("utf8"))["version"]
+    output = args.output_zip or ROOT/"dist"/f"cycles-frame-pipeline-windows-x64-{version}-{args.language}.zip"
     official = args.official_install
     info = subprocess.check_output([official/"blender.exe", "--version"], text=True,
                                    encoding="utf8", errors="replace")
@@ -116,20 +124,24 @@ def main():
     if not notices or any(p.suffix.lower() not in {".txt", ".md", ".json"} for p in notices):
         raise SystemExit("Unexpected contents in the official Blender license directory")
     image = release_executable(args.patched_exe)
-    args.output_zip.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=args.output_zip.parent) as temp:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent) as temp:
         staged = Path(temp)/"backend.zip"
         with ZipFile(staged, "w") as archive:
             add(archive, "blender.exe", image)
             add(archive, "install_backend.ps1", (ROOT/"tools/install_backend.ps1").read_bytes())
+            templates = ROOT/"tools/windows_release"
+            add(archive, "open_blender.ps1", (templates/"open_blender.ps1").read_bytes())
+            # Windows PowerShell 5.1 expects a BOM for localized UTF-8 data files.
+            messages = (templates/f"{args.language}.psd1").read_text(encoding="utf-8-sig")
+            add(archive, "install-messages.psd1", messages.encode("utf-8-sig"))
             add(archive, "COPYING", (ROOT/"COPYING").read_bytes())
             add(archive, "copyright.txt", (official/"copyright.txt").read_bytes())
             for notice in notices:
                 add(archive, notice.relative_to(official).as_posix(), notice.read_bytes())
-            add(archive, "README.md", instructions(version, False).encode("utf-8"))
-            add(archive, "README.zh-CN.md", instructions(version, True).encode("utf-8"))
-        staged.replace(args.output_zip)
-    print(f"{args.output_zip} ({args.output_zip.stat().st_size:,} bytes)")
+            add(archive, "README.md", instructions(version, args.language).encode("utf-8"))
+        staged.replace(output)
+    print(f"{output} ({output.stat().st_size:,} bytes)")
 
 
 if __name__ == "__main__":

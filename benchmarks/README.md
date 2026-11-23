@@ -2,7 +2,20 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Cycles rendered frames 624–633 of the Ruins production scene in order on one Radeon RX 7800 XT. Ten finished PNGs took **466.027 s** with **Cycles Frame Pipeline 0.3.0** and **560.246 s** with **Official Blender**, a reduction of **94.219 s (16.82%)**. The first prepared PNG took **208.306 s**, including both scene loading and startup. Each configuration ran once.
+For a **1,000-frame** animation with the same steady output pace as the measured Ruins sequence, Cycles Frame Pipeline is estimated to save **3 h 29 m 26 s (30.37%)** on a Radeon RX 7800 XT. The ten frames measured on that card saved **94.219 s (16.82%)**.
+
+![Measured ten-frame and estimated thousand-frame totals and time reductions relative to official Blender](projection-en.png)
+
+| Sequence | Official Blender | Cycles Frame Pipeline | Reduction relative to official |
+|---|---:|---:|---:|
+| 10 frames, measured | 560.246 s | 466.027 s | 16.82% |
+| 1,000 frames, estimated | 11 h 29 m 41 s | 8 h 00 m 15 s | 30.37% |
+
+The model counts one launch and one first frame. It adds 999 more PNG intervals at the mean pace of the nine measured intervals. From the millisecond measurements, `T₁₀₀₀ = T₁ + 999 × (T₁₀ − T₁) / 9`. For official Blender, `T₁ = 189.144 s` and `T₁₀ = 560.246 s`, giving **41,381.466 s**. For the release, `T₁ = 208.306 s` and `T₁₀ = 466.027 s`, giving **28,815.337 s**. Percent savings use the official time for the same sequence length as the denominator. The release's longer startup accounts for a smaller share of the 1,000-frame total. Changes in scene complexity or resource pressure across a longer sequence would change its actual time. [Projection inputs and results](data/projection.csv)
+
+## Measured ten-frame run
+
+Cycles rendered frames 624–633 of the Ruins production scene in order. Each configuration ran once. GPU utilization, VRAM, system memory and pixel comparisons below are measurements from those ten frames.
 
 ![Comparison of render time, GPU utilization, VRAM and system commit](overview-en.png)
 
@@ -16,11 +29,11 @@ Cycles rendered frames 624–633 of the Ruins production scene in order on one R
 | Frames | 624–633 in order, 1920 × 1080, 8-bit RGBA PNG |
 | Sampling and output | Up to 256 samples, adaptive threshold 0.01, CPU Open Image Denoise. Cycles Frame Pipeline used six threads in the postprocess worker. |
 
-**Official Blender** used the production worker with synchronous frame output. **Cycles Frame Pipeline 0.3.0** used asynchronous native denoising and output. It evaluated the next render frame, validated and packed its BVH, and uploaded its device data while the GPU sampled the current frame. The timed build and the release build differ by two configuration checks before inheriting the background importance map. The benchmark kept both the scene and the session configuration constant.
+**Official Blender** used the production worker with synchronous frame output. **Cycles Frame Pipeline** used asynchronous native denoising and output. It evaluated the next render frame, validated and packed its BVH, and uploaded its device data while the GPU sampled the current frame. The English and Simplified Chinese packages run the same Cycles rendering executable. The timed build and the release build differ by two configuration checks before inheriting the background importance map. The benchmark kept both the scene and the session configuration constant.
 
 ## Timing and resource measurements
 
-| Measurement | Official Blender | Cycles Frame Pipeline 0.3.0 |
+| Measurement | Official Blender | Cycles Frame Pipeline |
 |---|---:|---:|
 | Launch to first PNG (s) | 189.144 | 208.306 |
 | Launch to final PNG (s) | 560.246 | 466.027 |

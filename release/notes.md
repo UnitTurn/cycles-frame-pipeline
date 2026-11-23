@@ -1,19 +1,27 @@
-## English
+# Cycles Frame Pipeline 0.3.1
 
-Cycles Frame Pipeline 0.3.0 overlaps the next frame's scene evaluation, BVH preparation and upload with the current frame's GPU sampling. On the tested RX 7800 XT, 10 frames took 466.03 s versus 560.25 s with stock Blender. Peak dedicated GPU memory reached 12.29 GiB. Every decoded frame was within one 8-bit RGB level of the stock render.
+[简体中文发布说明](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/release/notes.zh-CN.md)
 
-- **Blender extension** — install `cycles_frame_pipeline-0.3.0.zip` from disk in Blender.
-- **Windows x64 engine overlay** — extract `cycles-frame-pipeline-windows-x64-0.3.0.zip` and follow the included installation instructions. Requires official Blender 5.2.1 LTS for Windows x64, upstream build `9e2066aef7ef`.
-- **Corresponding project sources** — `cycles_frame_pipeline-source-0.3.0.zip` includes the pinned build recipe, patch series, tests, documentation and benchmark data. The source tag also contains the release workflow.
+Choose the matching English or Simplified Chinese extension and Windows engine package. Each package uses one language. The two extensions share a Blender extension ID, and both engine packages contain the same rendering executable.
 
-[Installation and usage](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.0/README.md) · [Benchmark charts and measurements](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.0/benchmarks/README.md)
+After installation, use `open_blender.ps1` in the new runtime directory to open Blender in the selected language. Install the matching extension ZIP in that window. Each language edition keeps its own preferences and enabled extensions between launches.
 
-## 简体中文
+| Download | English | Simplified Chinese |
+|---|---|---|
+| Blender extension | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-0.3.1-en.zip) | [Chinese ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-0.3.1-zh-CN.zip) |
+| Windows x64 engine | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles-frame-pipeline-windows-x64-0.3.1-en.zip) | [Chinese ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles-frame-pipeline-windows-x64-0.3.1-zh-CN.zip) |
 
-0.3.0 支持在当前帧 GPU 采样期间完成下一帧的正式场景求值、BVH 准备和上传。RX 7800 XT 十帧实测从官方的 560.25 秒缩短到 466.03 秒，专用显存峰值为 12.29 GiB。每帧相对官方成片的最大 RGB 通道差均为 1/255。
+The overlay requires official Blender 5.2.1 LTS for Windows x64, upstream build `9e2066aef7ef`. Install the extension from disk in Blender. [Installation and usage](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/README.md) · [Project source archive](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-source-0.3.1.zip)
 
-- **Blender 插件** — 在 Blender 中从磁盘安装 `cycles_frame_pipeline-0.3.0.zip`。
-- **Windows x64 配套引擎** — 解压 `cycles-frame-pipeline-windows-x64-0.3.0.zip`，按包内说明将引擎安装到独立目录。需要官方 Windows x64 Blender 5.2.1 LTS，提交 `9e2066aef7ef`。
-- **对应项目源码** — `cycles_frame_pipeline-source-0.3.0.zip` 含固定版本的构建脚本、补丁、测试、中英说明和基准数据。仓库的源代码标签另含发布工作流。
+### Ten measured frames and a 1,000-frame projection
 
-[中文版安装和用法](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.0/README.zh-CN.md) · [性能图表和测量数据](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.0/benchmarks/README.zh-CN.md)
+| Frame count | Official Blender | Cycles Frame Pipeline | Time saved |
+|---|---:|---:|---:|
+| 10 measured | 560.25 s | 466.03 s | 94.22 s (16.82%) |
+| 1,000 projected | 11 h 29 min 41 s | 8 h 00 min 15 s | 3 h 29 min 26 s (30.37%) |
+
+The test used one RX 7800 XT. After the first PNG, average whole-card GPU utilization increased from 69.91% to 94.85%. Peak dedicated GPU memory rose from 8.62 to 12.29 GiB. All ten images were within one 8-bit RGB level of official Blender, with identical alpha. The projection charges each configuration for its first frame once, followed by 999 intervals at its measured average cadence over the next nine images. It assumes subsequent frames have similar rendering costs.
+
+![Measured and projected render-time reductions](https://raw.githubusercontent.com/expitau-one/cycles-frame-pipeline/v0.3.1/benchmarks/projection-en.png)
+
+[Benchmark charts, measurements and calculation](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/benchmarks/README.md)
