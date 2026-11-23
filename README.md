@@ -6,7 +6,7 @@ Render consecutive Blender animation frames on one GPU. While Cycles samples fra
 
 On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **560.25 s to 466.03 s** on a Radeon RX 7800 XT. Average GPU utilization after the first PNG rose from **69.91% to 94.85%**. Peak dedicated GPU memory rose from **8.62 GiB to 12.29 GiB**.
 
-![Ten-frame render time, GPU utilization and peak memory for stock Blender, previous-frame BVH reuse and prepared frames](benchmarks/overview-en.png)
+![Ten-frame render time, GPU utilization and peak memory for stock Blender and Cycles Frame Pipeline 0.3.0](benchmarks/overview-en.png)
 
 [Install](#install) · [Render an animation](#render-an-animation) · [Benchmark and image quality](#benchmark-and-image-quality) · [Build and test](#build-and-test)
 
@@ -45,27 +45,24 @@ On a ten-frame 1080p animation, the pipeline cut time to the final PNG from **56
 | Option | Use |
 |---|---|
 | `--bvh-input prepared` | Opt in to two sessions. One samples while the other prepares the next production frame. Requires `--mode native`. |
-| `--bvh-input previous` | Use one render session and reuse verified BVH subtrees from the previous frame. This is the lower-VRAM comparison below. |
-| `--bvh-input next` | Evaluate a separate candidate for the next frame and build its BVH ahead of time. The production frame validates it before use. |
-| `--bvh-input off` | Turn off BVH optimization. Pair with `--mode serial` for an inline reference render. |
 | `--profile scene` / `ruins-hip256` | Use saved settings, or select the RX 7800 XT benchmark preset with standard HIP, up to 256 samples and a 0.01 adaptive threshold. |
 | `--existing error` / `skip` / `replace` | Stop at an existing PNG (default), skip it, or overwrite it. |
 
 ## Benchmark and image quality
 
-**Ruins**, frames 624–633 in order, 1920×1080, RX 7800 XT, standard HIP, persistent data, up to 256 adaptive samples, threshold 0.01 and six CPU OIDN threads. Each configuration ran once. The previous pipeline combines previous-frame BVH reuse with asynchronous native output.
+**Ruins**, frames 624–633 in order, 1920×1080, RX 7800 XT, standard HIP, persistent data, up to 256 adaptive samples, threshold 0.01 and six CPU OIDN threads. Stock Blender and the 0.3.0 pipeline each rendered the full sequence once.
 
-| Metric | Stock Blender | Previous pipeline | Prepared frames |
-|---|---:|---:|---:|
-| Launch to first PNG | 189.14 s | 198.80 s | 208.31 s |
-| Launch to final PNG | 560.25 s | 516.92 s | **466.03 s** |
-| Mean interval between subsequent PNGs | 41.23 s | 35.35 s | **28.64 s** |
-| Mean GPU utilization after first PNG | 69.91% | 80.80% | **94.85%** |
-| Time below 10% GPU utilization after first PNG | 81.82 s | 22.00 s | **3.00 s** |
-| Peak dedicated GPU memory | 8.62 GiB | 7.95 GiB | **12.29 GiB** |
-| Peak system committed memory | 73.10 GiB | 72.38 GiB | **85.21 GiB** |
+| Metric | Stock Blender | Cycles Frame Pipeline 0.3.0 |
+|---|---:|---:|
+| Launch to first PNG | 189.14 s | 208.31 s |
+| Launch to final PNG | 560.25 s | **466.03 s** |
+| Mean interval between subsequent PNGs | 41.23 s | **28.64 s** |
+| Mean GPU utilization after first PNG | 69.91% | **94.85%** |
+| Time below 10% GPU utilization after first PNG | 81.82 s | **3.00 s** |
+| Peak dedicated GPU memory | 8.62 GiB | **12.29 GiB** |
+| Peak system committed memory | 73.10 GiB | **85.21 GiB** |
 
-Prepared frames saved **94.22 s (16.82%)** over stock Blender and **50.90 s (9.85%)** over the previous pipeline from launch to the final PNG. All nine subsequent frames were ready before the previous frame's last sampling batch ended. The median gap between successive sampling windows was **0.139 s**, versus **6.283 s** in the previous pipeline's same-order instrumented run. GPU activity is whole-card utilization sampled at about 1 Hz. System commit includes memory backed by RAM or the Windows page file. Peak physical memory was 31.95 GiB in all three runs.
+The 0.3.0 pipeline saved **94.22 s (16.82%)** over stock Blender from launch to the final PNG. At all nine frame transitions, preparation finished before the GPU completed its last sampling batch on the active frame. The median gap between successive sampling windows was **0.139 s**. GPU activity is whole-card utilization sampled at about 1 Hz. System commit includes memory backed by RAM or the Windows page file. Peak physical memory was 31.95 GiB in both runs.
 
 **Image comparison.** Across ten decoded PNG pairs, 5,343 of 20,736,000 pixels differed from stock Blender by one 8-bit RGB level. All other RGB values and all alpha values matched. The two sessions inherit the same cached environment-light sampling distribution and update it when the world changes. A separate four-frame test of the release executable changed world intensity in frame 3. All four RGBA outputs matched stock pixel for pixel.
 

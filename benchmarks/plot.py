@@ -8,12 +8,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from matplotlib.patches import Patch
 from matplotlib.ticker import FixedLocator
 
 
 HERE = Path(__file__).resolve().parent
-RUNS = ("official", "previous", "prepared")
-COLORS = ("#65778C", "#C16D2D", "#007D71")
+RUNS = ("official_blender", "cycles_frame_pipeline_0.3.0")
+COLORS = ("#65778C", "#007D71")
 INK, MUTED, GRID = "#132D3D", "#475F70", "#DDE5E9"
 METRICS = (
     ("launch_to_last_png_s", 600, (0, 200, 400, 600), "s"),
@@ -25,7 +26,7 @@ METRICS = (
 )
 TEXT = {
     "en": {
-        "names": ("Official", "Previous", "Prepared"),
+        "names": ("Official Blender", "Cycles Frame Pipeline 0.3.0"),
         "overview": "Ten consecutive animation frames",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   Frames 624–633",
         "metrics": ("Launch to final PNG", "Mean interval between PNGs", "Mean GPU utilization",
@@ -38,7 +39,7 @@ TEXT = {
         "notes": "Each column shows one complete run. Dashed lines mark publication of the first and last PNG.",
     },
     "zh": {
-        "names": ("官方", "上一版", "正式帧交接"),
+        "names": ("官方 Blender", "发布版 0.3.0"),
         "overview": "连续十帧动画渲染",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   第 624–633 帧",
         "metrics": ("启动至最后一张 PNG 写完", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
@@ -82,15 +83,18 @@ def heading(fig, title, subtitle):
 def overview(language, summary):
     words = TEXT[language]
     fig, axes = plt.subplots(3, 2, figsize=(12.5, 8.5))
-    fig.subplots_adjust(left=.145, right=.968, bottom=.08, top=.80, wspace=.39, hspace=.86)
+    fig.subplots_adjust(left=.067, right=.96, bottom=.075, top=.748, wspace=.25, hspace=.92)
     heading(fig, words["overview"], words["subtitle"])
+    handles = [Patch(facecolor=color, label=name) for name, color in zip(words["names"], COLORS)]
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(.065, .873),
+               ncol=len(RUNS), frameon=False, borderaxespad=0, fontsize=11, handlelength=1.3)
     for i, (ax, (key, limit, ticks, unit)) in enumerate(zip(axes.flat, METRICS)):
         values = [float(summary[run][key]) for run in RUNS]
-        ax.barh([0, 1, 2], values, color=COLORS, height=.47)
-        ax.set_ylim(2.62, -.65)
+        ax.barh(range(len(RUNS)), values, color=COLORS, height=.46)
+        ax.set_ylim(len(RUNS) - .4, -.6)
         ax.set_xlim(0, limit * 1.12)
         ax.xaxis.set_major_locator(FixedLocator(ticks))
-        ax.set_yticks([0, 1, 2], words["names"])
+        ax.set_yticks([])
         style_axis(ax)
         ax.grid(axis="x", color=GRID, linewidth=.8)
         ax.set_title(words["metrics"][i], loc="left", color=INK, fontsize=14.5,
@@ -106,7 +110,7 @@ def overview(language, summary):
 
 def telemetry(language, summary, rows):
     words = TEXT[language]
-    fig, axes = plt.subplots(3, 3, sharex=True, sharey="row", figsize=(13, 8.1))
+    fig, axes = plt.subplots(3, len(RUNS), sharex=True, sharey="row", figsize=(13, 8.1))
     fig.subplots_adjust(left=.083, right=.976, bottom=.14, top=.775, hspace=.31, wspace=.10)
     heading(fig, words["traces"], words["subtitle"])
     y_metrics = (("gpu_busy_pct", "%", (0, 50, 100)), ("vram_used_gib", "GiB", (0, 8, 16)),
