@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def git(*args, data=None):
     result = subprocess.run(["git", *args], cwd=ROOT, input=data, stdout=subprocess.PIPE,
-                            text=True, check=True)
-    return result.stdout.strip()
+                            check=True)
+    return result.stdout.decode("ascii").strip()
 
 
 def main():
@@ -24,9 +24,12 @@ def main():
     with asset.open("rb") as f:
         digest = hashlib.file_digest(f, "sha256").hexdigest()
     blob = git("hash-object", "-w", "--", str(asset))
-    tree = git("mktree", data=f"100644 blob {blob}\t{asset.name}\n")
-    commit = git("commit-tree", tree, "-m", f"Stage tested Windows overlay for {tag}")
     local_ref = f"refs/cycles-frame-pipeline/release-input/{tag}"
+    tree = git("mktree", "-z", data=f"100644 blob {blob}\t{asset.name}\0".encode("ascii"))
+    previous = subprocess.run(["git", "rev-parse", "--verify", "--quiet", local_ref], cwd=ROOT,
+                              stdout=subprocess.PIPE)
+    parents = ["-p", previous.stdout.decode("ascii").strip()] if previous.returncode == 0 else []
+    commit = git("commit-tree", tree, *parents, "-m", f"Stage tested Windows overlay for {tag}")
     git("update-ref", local_ref, commit)
     (ROOT / "release/windows-overlay.sha256").write_bytes(
         f"{digest}  {asset.name}\n".encode("ascii"))
