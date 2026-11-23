@@ -35,19 +35,22 @@ Each configuration rendered the entire sequence once in a fresh process. Officia
 | Launch to final PNG | 576.072 s | 472.271 s | 476.824 s |
 | Launch to process exit | 591.002 s | 488.001 s | 499.010 s |
 | Mean interval between PNGs | 42.545 s | 30.208 s | 28.935 s |
-| Mean GPU utilization between first and final PNG | 71.39% | 91.52% | 94.86% |
-| Time below 10% GPU utilization in that window | 3.007 s | 10.267 s | 0.000 s |
+| Mean whole-card GPU activity (AMD ADL) | 71.39% | 91.52% | 94.86% |
+| Blender main process below 10% GPU, estimated time | 118.9 s | 11.3 s | 10.8 s |
+| Share of each run’s nine-frame time below 10% | 31.04% | 4.15% | 4.16% |
 | Peak dedicated VRAM | 8.53 GiB | 8.46 GiB | 12.40 GiB |
 | Peak physical RAM in use | 31.95 GiB | 31.95 GiB | 31.95 GiB |
 | Peak system commit | 73.89 GiB | 76.31 GiB | 87.49 GiB |
 
 ![Timing, GPU utilization and memory for official Blender and both pipeline modes](overview-en.png)
 
-The GPU activity sensor (AMD ADL) and dedicated VRAM counter (Windows WDDM) cover the entire card. Physical RAM and commit cover the entire system. Commit measures memory Windows has committed to back with RAM or the page file. Before launch, in table order, dedicated VRAM was **2.65 / 2.71 / 2.53 GiB** and system commit was **28.38 / 30.42 / 28.57 GiB**.
+**Low GPU time** counts intervals when the busiest GPU engine attributed to Blender’s main render process averaged strictly below 10%. Windows WDDM provides this rate in `wddm_render_gpu_pct`. Work attributed to other processes, including the separate output worker, is outside the counter’s scope. The window runs from frame 624’s completed PNG to frame 633’s completed PNG, including time spent finishing the last output. [PNG timestamps](data/frames.csv)
 
-The monitor sampled approximately once per second. Mean GPU utilization and time below 10% weight each reading by its duration between publication of the first and final PNG. Memory peaks cover launch through process exit. The two vertical lines in each timeline mark the first and final PNG. [Telemetry samples](data/telemetry.csv) · [Run summaries](data/summary.csv)
+The monitor sampled about once a second. Each WDDM reading describes the interval ending at its timestamp. For readings below 10%, we sum the portion of that interval inside the PNG window, then divide by that run’s window duration to get its share. A numeric zero counts. Empty readings mean missing data. All three windows have complete coverage. The two pipeline modes differ by 0.45 s, less than one sample period. [Samples](data/telemetry.csv) · [Calculation](plot.py) · [Run summaries](data/summary.csv) · [Windows rate counter sampling](https://learn.microsoft.com/en-us/windows/win32/perfctrs/collecting-performance-data)
 
-![One-second GPU, VRAM, physical RAM and system commit traces for the three runs](telemetry-en.png)
+Mean whole-card activity uses the AMD ADL sensor. The summary retains the earlier whole-card estimate in `warm_card_gpu_below_10_s`. Dedicated VRAM covers the entire card. Physical RAM and commit cover the entire system from launch to exit. Commit measures memory Windows has committed to back with RAM or the page file. Before launch, in table order, dedicated VRAM was **2.65 / 2.71 / 2.53 GiB** and system commit was **28.38 / 30.42 / 28.57 GiB**.
+
+![Whole-card and Blender main-process GPU activity, VRAM, physical RAM and system commit for each run](telemetry-en.png)
 
 ## What happened at each handoff
 
@@ -69,7 +72,7 @@ The pixel comparison decodes each prepared PNG and compares it with the official
 
 ## Redrawing the charts
 
-From the repository root, run the following commands. The Chinese charts require a supported Chinese font such as Microsoft YaHei or Noto Sans CJK SC. Use `--language en` to generate only the English edition.
+Run these commands from the repository root to recalculate low GPU time and its share in `benchmarks/data/summary.csv` from the published samples and redraw the charts. The Chinese charts require a supported Chinese font such as Microsoft YaHei or Noto Sans CJK SC. Use `--language en` to generate only the English edition.
 
 ```console
 python -m pip install matplotlib

@@ -21,7 +21,7 @@ METRICS = (
     ("measured_nine_intervals_s", 400, (0, 100, 200, 300, 400), "s"),
     ("warm_average_png_interval_s", 45, (0, 15, 30, 45), "s"),
     ("warm_card_gpu_pct", 100, (0, 25, 50, 75, 100), "%"),
-    ("warm_card_gpu_below_10_s", 12, (0, 4, 8, 12), "s"),
+    ("warm_render_gpu_below_10_s", 120, (0, 40, 80, 120), "s"),
     ("vram_peak_gib", 16, (0, 4, 8, 12, 16), "GiB"),
     ("system_commit_peak_gib", 100, (0, 25, 50, 75, 100), "GiB"),
 )
@@ -30,14 +30,14 @@ TEXT = {
         "names": ("Official Blender", "Host BVH prepacking · default", "Eager GPU upload · optional"),
         "overview": "Ten consecutive animation frames",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   Frames 624–633",
-        "metrics": ("Time for frames 625–633", "Mean interval between PNGs", "Mean GPU utilization",
-                    "Time with GPU below 10%", "Peak dedicated VRAM", "Peak system commit"),
-        "windows": ("First PNG to tenth PNG", "Nine warm intervals", "Nine warm intervals",
-                    "Nine warm intervals", "Launch to process exit", "Launch to process exit"),
+        "metrics": ("Time for frames 625–633", "Mean interval between PNGs", "Mean whole-card GPU activity",
+                    "Time with Blender below 10% GPU", "Peak dedicated VRAM", "Peak system commit"),
+        "windows": ("First PNG to tenth PNG", "Nine warm intervals", "AMD ADL · nine warm intervals",
+                    "Main process · WDDM busiest engine · share of nine intervals", "Launch to process exit", "Launch to process exit"),
         "traces": "GPU and memory over time",
-        "trace_labels": ("GPU utilization", "Dedicated VRAM", "Physical RAM", "System commit"),
+        "trace_labels": ("AMD whole card", "Blender process", "Dedicated VRAM", "Physical RAM", "System commit"),
         "time": "Seconds since launch",
-        "notes": "Each column shows one complete run. Dashed lines mark publication of the first and last PNG.",
+        "notes": "Vertical lines mark the first and final PNG. The horizontal dotted line marks 10% on Blender's busiest WDDM engine.",
         "projection_title": "Nine measured frames after the first PNG",
         "projection_sub": "Ruins · Radeon RX 7800 XT · Elapsed time from publication of frame 624 to publication of frame 633",
         "projection_cols": ("Render mode", "Frames 625–633", "Time reduction vs stock", "1,000 frames · estimate"),
@@ -48,14 +48,14 @@ TEXT = {
         "names": ("官方 Blender", "主机端 BVH 预打包 · 默认", "提前上传显存 · 可选"),
         "overview": "连续十帧动画渲染",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   第 624–633 帧",
-        "metrics": ("第 625–633 帧出图耗时", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
-                    "GPU 利用率低于 10% 的时长", "专用显存峰值", "系统提交内存峰值"),
-        "windows": ("首张至第十张 PNG 写完", "后九个出图间隔", "后九个出图间隔",
-                    "后九个出图间隔", "从启动到进程退出", "从启动到进程退出"),
+        "metrics": ("第 625–633 帧出图耗时", "相邻 PNG 平均出图间隔", "整卡 GPU 平均利用率",
+                    "Blender 主进程 GPU 占用低于 10% 的时长", "专用显存峰值", "系统提交内存峰值"),
+        "windows": ("首张至第十张 PNG 写完", "后九个出图间隔", "AMD ADL · 后九个出图间隔",
+                    "WDDM 最忙引擎 · 时长及其占后九帧耗时的比例", "从启动到进程退出", "从启动到进程退出"),
         "traces": "GPU 与内存使用时间线",
-        "trace_labels": ("GPU 利用率", "专用显存", "物理内存", "系统提交内存"),
+        "trace_labels": ("AMD 整卡", "Blender 主进程", "专用显存", "物理内存", "系统提交内存"),
         "time": "距启动时间（秒）",
-        "notes": "每列对应一组完整测试。两条虚线依次标出首张和末张 PNG 写完的时间。",
+        "notes": "竖虚线标出首张和末张 PNG 写完的时刻。横向点线标出 Blender 主进程最忙 WDDM 引擎的 10% 占用阈值。",
         "projection_title": "首帧之后连续九帧的实测耗时",
         "projection_sub": "Ruins · Radeon RX 7800 XT · 从第 624 帧 PNG 写完计时，至第 633 帧 PNG 写完",
         "projection_cols": ("渲染模式", "第 625–633 帧", "相对官方耗时降幅", "1,000 帧总耗时估算"),
@@ -89,6 +89,34 @@ def style_axis(ax):
 def heading(fig, title, subtitle):
     fig.text(.065, .966, title, va="top", fontsize=25, fontweight="bold", color=INK)
     fig.text(.066, .907, subtitle, va="top", fontsize=10.5, color=MUTED)
+
+
+def update_low_gpu_summary(summary, timeline):
+    for run, row in summary.items():
+        start = Decimal(row["launch_to_first_png_s"])
+        end = Decimal(row["launch_to_last_png_s"])
+        samples = [s for s in timeline if s["run"] == run]
+        covered = low = Decimal(0)
+        for previous, current in zip(samples, samples[1:]):
+            left = Decimal(previous["seconds_from_launch"])
+            right = Decimal(current["seconds_from_launch"])
+            if right <= left:
+                raise ValueError(f"{run} has out-of-order timestamps at {right} s")
+            overlap = min(end, right) - max(start, left)
+            # A WDDM rate at the end of an interval describes that interval.
+            rate = current["wddm_render_gpu_pct"]
+            if overlap > 0 and rate != "":
+                covered += overlap
+                if Decimal(rate) < 10:
+                    low += overlap
+        if end <= start or covered != end - start:
+            raise ValueError(f"{run} has {covered} s of WDDM data for a {end - start} s window")
+        row["warm_render_gpu_below_10_s"] = f"{low:.3f}"
+        row["warm_render_gpu_below_10_pct"] = f"{100 * low / covered:.2f}"
+    with (HERE / "data" / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=next(iter(summary.values())), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(summary.values())
 
 
 def project_1000_frames(summary):
@@ -179,18 +207,25 @@ def overview(language, summary):
                 color=MUTED, fontsize=9.2)
         precision = 3 if unit == "s" else 2
         for pos, value in enumerate(values):
-            ax.text(value + limit * .017, pos, f"{value:.{precision}f}{'' if unit == '%' else ' '}{unit}",
-                    va="center", ha="left", fontsize=10.5, color=INK)
+            label = f"{value:.{precision}f}{'' if unit == '%' else ' '}{unit}"
+            x, align, color = value + limit * .017, "left", INK
+            if key == "warm_render_gpu_below_10_s":
+                share = summary[RUNS[pos]]["warm_render_gpu_below_10_pct"]
+                label = f"{value:.1f} s ({share}%)"
+                if value > limit * .65:
+                    x, align, color = value - limit * .017, "right", "white"
+            ax.text(x, pos, label, va="center", ha=align, fontsize=10.5, color=color)
     fig.savefig(HERE / f"overview-{language}.png", dpi=150, facecolor="white")
     plt.close(fig)
 
 
 def telemetry(language, summary, rows):
     words = TEXT[language]
-    fig, axes = plt.subplots(4, len(RUNS), sharex=True, sharey="row", figsize=(14.5, 9))
+    fig, axes = plt.subplots(5, len(RUNS), sharex=True, sharey="row", figsize=(14.5, 10))
     fig.subplots_adjust(left=.083, right=.976, bottom=.13, top=.79, hspace=.35, wspace=.10)
     heading(fig, words["traces"], words["subtitle"])
-    y_metrics = (("gpu_busy_pct", "%", (0, 50, 100)), ("vram_used_gib", "GiB", (0, 8, 16)),
+    y_metrics = (("gpu_busy_pct", "%", (0, 50, 100)), ("wddm_render_gpu_pct", "%", (0, 50, 100)),
+                 ("vram_used_gib", "GiB", (0, 8, 16)),
                  ("ram_used_gib", "GiB", (0, 16, 32)), ("commit_gib", "GiB", (0, 50, 100)))
     end = 150 * ceil(max(float(summary[run]["launch_to_exit_s"]) for run in RUNS) / 150)
     for column, run in enumerate(RUNS):
@@ -199,9 +234,13 @@ def telemetry(language, summary, rows):
         for index, (key, unit, ticks) in enumerate(y_metrics):
             ax = axes[index, column]
             style_axis(ax)
-            valid = [(float(r["seconds_from_launch"]), float(r[key])) for r in series if r[key]]
-            x, y = zip(*valid)
-            ax.plot(x, y, lw=1.1, color=COLORS[column])
+            x = [float(r["seconds_from_launch"]) for r in series]
+            y = [float(r[key]) if r[key] else float("nan") for r in series]
+            if key == "wddm_render_gpu_pct":
+                ax.step(x, y, where="pre", lw=1.1, color=COLORS[column])
+                ax.axhline(10, color=INK, ls=":", lw=1)
+            else:
+                ax.plot(x, y, lw=1.1, color=COLORS[column])
             for event in ("launch_to_first_png_s", "launch_to_last_png_s"):
                 ax.axvline(float(summary[run][event]), color=MUTED, lw=.9, dashes=(3, 3), zorder=1)
             ax.set_yticks(ticks)
@@ -226,6 +265,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     summary_rows = {r["run"]: r for r in read_data("summary.csv")}
     timeline_rows = read_data("telemetry.csv")
+    update_low_gpu_summary(summary_rows, timeline_rows)
     projected_rows = project_1000_frames(summary_rows)
     for row in projected_rows:
         summary_rows[row["run"]]["measured_nine_intervals_s"] = row["measured_nine_intervals_s"]
