@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "cycles_frame_pipeline"
+version = "0.3.0"
+name = "Cycles 帧间流水线"
+tagline = "用配套 Cycles 引擎并行处理原生降噪与下一帧 BVH"
+maintainer = "Cycles Frame Pipeline contributors"
+type = "add-on"
+tags = ["Render"]
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "读取渲染场景，保存中间图像、最终帧和运行日志"

@@ -1,0 +1,244 @@
+--- a/intern/cycles/scene/light.h
++++ b/intern/cycles/scene/light.h
+@@ -204,6 +204,8 @@
+   /* Need to update background (including multiple importance map) */
+   bool need_update_background;
+ 
++  /* Continue the preceding official frame's cached MIS state on a separate device. */
++  bool inherit_background_history(Scene &dst, const Scene &src);
+   LightManager();
+ 
+   /* IES texture management */
+@@ -251,6 +253,10 @@
+   vector<unique_ptr<IESSlot>> ies_slots;
+   thread_mutex ies_mutex;
+ 
++  static BackgroundLight *enabled_background_light(const Scene &scene);
++  uint64_t background_revision = 0;
++  bool background_upload_pending = false;
++  float inherited_radiance = -1.0f;
+   bool last_background_enabled;
+   int last_background_resolution;
+ 
+--- a/intern/cycles/scene/light.cpp
++++ b/intern/cycles/scene/light.cpp
+@@ -1387,6 +1387,78 @@
+   dscene->light_background_conditional_cdf.copy_to_device();
+ }
+ 
++BackgroundLight *LightManager::enabled_background_light(const Scene &scene)
++{
++  BackgroundLight *last = nullptr;
++  for (const Object *object : scene.objects) {
++    Geometry *geom = object->get_geometry();
++    if (geom && geom->is_light()) {
++      Light *light = static_cast<Light *>(geom);
++      if (light->is_background_light() && light->is_enabled) {
++        last = static_cast<BackgroundLight *>(light);
++      }
++    }
++  }
++  return last;
++}
++
++bool LightManager::inherit_background_history(Scene &dst, const Scene &src)
++{
++  const LightManager &prev = *src.light_manager;
++  if (prev.background_revision == 0 || prev.need_update_background) {
++    return false;
++  }
++  if (background_revision == prev.background_revision) {
++    return true;
++  }
++
++  /* A completed persistent session retains the exact importance bake, including the
++   * camera-space inputs evaluated when that bake occurred. Each lane owns its GPU storage. */
++  const KernelBackground &from = src.dscene.data.background;
++  KernelBackground &to = dst.dscene.data.background;
++  const auto copy_cdf = [](auto &out, const auto &in) {
++    if (in.size() == 0) {
++      out.free();
++      return true;
++    }
++    auto *data = out.alloc(in.size());
++    if (!data || !in.data()) {
++      return false;
++    }
++    std::copy_n(in.data(), in.size(), data);
++    out.tag_modified();
++    return true;
++  };
++  if (!copy_cdf(dst.dscene.light_background_marginal_cdf, src.dscene.light_background_marginal_cdf) ||
++      !copy_cdf(dst.dscene.light_background_conditional_cdf, src.dscene.light_background_conditional_cdf)) {
++    need_update_background = true;
++    return false;
++  }
++  to.sun = from.sun;
++  to.use_sun_guiding = from.use_sun_guiding;
++  to.sun_weight = from.sun_weight;
++  to.map_weight = from.map_weight;
++  to.portal_weight = from.portal_weight;
++  to.map_res_x = from.map_res_x;
++  to.map_res_y = from.map_res_y;
++  to.map_dD = from.map_dD;
++  to.use_mis = from.use_mis;
++  last_background_enabled = prev.last_background_enabled;
++  last_background_resolution = prev.last_background_resolution;
++
++  const BackgroundLight *light = enabled_background_light(src);
++  inherited_radiance = light ? light->get_average_radiance() : -1.0f;
++  background_upload_pending = true;
++  background_revision = prev.background_revision;
++  need_update_background = false;
++  /* Device update must still install the inherited flux in the destination's light tree. */
++  update_flags |= LIGHT_MODIFIED;
++  std::fprintf(stderr, "READYFRAME_WORLD_MIS inherited=%llu entries=%zu average=%.9g\n",
++               (unsigned long long)background_revision, src.dscene.light_background_conditional_cdf.size(),
++               double(inherited_radiance));
++  return true;
++}
++
+ void LightManager::count_lights(KernelIntegrator *kintegrator, const Scene *scene)
+ {
+   size_t num_lights = 0;
+@@ -1467,6 +1539,20 @@
+ 
+   /* Detect which lights are enabled, also determines if we need to update the background. */
+   test_enabled_lights(scene);
++  if (background_upload_pending) {
++    /* The session has now loaded its own device module and kernel globals. */
++    if (!need_update_background) {
++      dscene->light_background_marginal_cdf.copy_to_device_if_modified();
++      dscene->light_background_conditional_cdf.copy_to_device_if_modified();
++      if (inherited_radiance >= 0.0f) {
++        if (BackgroundLight *light = enabled_background_light(*scene)) {
++          light->set_average_radiance(inherited_radiance);
++        }
++      }
++    }
++    inherited_radiance = -1.0f;
++    background_upload_pending = false;
++  }
+ 
+   device_free(device, dscene, need_update_background);
+ 
+@@ -1480,6 +1566,7 @@
+     if (progress.get_cancel()) {
+       return;
+     }
++    ++background_revision;
+   }
+ 
+   device_update_distribution(device, dscene, scene, progress);
+--- a/intern/cycles/scene/image.h
++++ b/intern/cycles/scene/image.h
+@@ -171,6 +171,7 @@
+                           Progress &progress,
+                           const set<const ImageSingle *> &images);
+ 
++  bool animation_frame_would_update(const int frame);
+   bool set_animation_frame_update(const int frame);
+   void warm_packed_stills(Device &device, Scene &scene, Scene &source_scene,
+                           bool (*same_source)(const ImageLoader &, const ImageLoader &));
+--- a/intern/cycles/scene/image.cpp
++++ b/intern/cycles/scene/image.cpp
+@@ -227,6 +227,19 @@
+     assert(!img);
+     (void)img;
+   }
++}
++
++bool ImageManager::animation_frame_would_update(const int frame)
++{
++  const thread_scoped_lock device_lock(images_mutex);
++  if (frame != animation_frame) {
++    for (const ImageSingle *img : images) {
++      if (img && img->params.animated) {
++        return true;
++      }
++    }
++  }
++  return false;
+ }
+ 
+ bool ImageManager::set_animation_frame_update(const int frame)
+--- a/intern/cycles/blender/shader.cpp
++++ b/intern/cycles/blender/shader.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include "BKE_duplilist.hh"
+ #include "BKE_node.hh"
++#include "BKE_scene.hh"
+ #include "BKE_node_runtime.hh"
+ 
+ #include "NOD_shader.h"
+@@ -1775,10 +1776,25 @@
+ 
+   Shader *shader = scene->default_background;
+ 
+-  if (world_recalc || update_all || b_world != world_map ||
+-      viewport_parameters.shader_modified(new_viewport_parameters) ||
+-      scene_attr_needs_recalc(shader, b_depsgraph) || (shader->has_time_dependency && update_time))
+-  {
++  /* Between lanes the shader copy may be one frame older than the immediately
++   * preceding official frame. Refresh that local copy as required, but invalidate
++   * the inherited importance map only when sequential Cycles would invalidate it. */
++  const auto needs_world_graph = [&](BlenderSync &state, bool all, bool time_changed) {
++    Shader *world_shader = state.scene->default_background;
++    return state.world_recalc || all || b_world != state.world_map ||
++           state.viewport_parameters.shader_modified(new_viewport_parameters) ||
++           state.scene_attr_needs_recalc(world_shader, b_depsgraph) ||
++           (world_shader->has_time_dependency && time_changed);
++  };
++  const bool local_update = needs_world_graph(*this, update_all, update_time);
++  bool sequential_update = local_update;
++  if (BlenderSync *previous = formal_background_previous) {
++    const float frame = BKE_scene_frame_get(b_scene);
++    sequential_update = needs_world_graph(*previous,
++        previous->scene->image_manager->animation_frame_would_update(int(frame)),
++        previous->frame_last_synced != frame);
++  }
++  if (local_update || sequential_update) {
+     unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
+ 
+     /* create nodes */
+@@ -1873,7 +1889,11 @@
+     resolve_view_layer_attributes(shader, graph.get(), b_depsgraph);
+ 
+     shader->set_graph(std::move(graph));
++    const bool already_dirty = scene->light_manager->need_update_background;
+     shader->tag_update(scene);
++    if (!sequential_update) {
++      scene->light_manager->need_update_background = already_dirty;
++    }
+   }
+ 
+   /* Fast GI */
+--- a/intern/cycles/blender/sync.h
++++ b/intern/cycles/blender/sync.h
+@@ -76,6 +76,8 @@
+   void sync_integrator(blender::ViewLayer &b_view_layer,
+                        bool background,
+                        const DeviceInfo &denoise_device_info);
++  /* Valid only inside the main-thread sync of a prepared frame. */
++  BlenderSync *formal_background_previous = nullptr;
+   void sync_scene_attributes();
+   void sync_camera(const blender::RenderData &b_render,
+                    const int width,
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -530,7 +530,14 @@
+                       &python_thread_state,
+                       session_params.denoise_device);
+     };
++    if (formal_request_ && other_session_ && other_sync_ &&
++        !scene->params.modified(other_session_->scene->params) &&
++        !session->params.modified(other_session_->params) &&
++        scene->light_manager->inherit_background_history(*scene, *other_session_->scene)) {
++      sync->formal_background_previous = other_sync_.get();
++    }
+     sync_view();
++    sync->formal_background_previous = nullptr;
+     if (BVHExactFrames::producing()) {
+       /* The main persistent session synchronizes N before N+1. Populate the
+        * same object map at N, then evaluate the future frame in this render

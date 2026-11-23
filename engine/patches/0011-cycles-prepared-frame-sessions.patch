@@ -1,0 +1,799 @@
+diff --git a/intern/cycles/session/formal_frame.h b/intern/cycles/session/formal_frame.h
+new file mode 100644
+--- /dev/null
++++ b/intern/cycles/session/formal_frame.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <memory>
++#include <mutex>
++
++#include "util/string.h"
++
++CCL_NAMESPACE_BEGIN
++
++class Progress;
++class Scene;
++class BVHFrameLookahead;
++class FormalFrame;
++
++/* Formal capture may outlive the Blender call which submitted it. Each lane owns one
++ * immutable destination. Worker and submitter may bind it concurrently. */
++struct NativeFrameCapture {
++  const int frame;
++  const string path;
++  FormalFrame *job;
++  std::atomic<bool> completed{false};
++  std::atomic<const void *> session{nullptr};
++};
++
++inline thread_local NativeFrameCapture *bound_native_capture = nullptr;
++
++class NativeFrameCaptureScope {
++ public:
++  explicit NativeFrameCaptureScope(NativeFrameCapture *capture) : previous_(bound_native_capture)
++  {
++    bound_native_capture = capture;
++  }
++  ~NativeFrameCaptureScope() { bound_native_capture = previous_; }
++  NativeFrameCaptureScope(const NativeFrameCaptureScope &) = delete;
++  NativeFrameCaptureScope &operator=(const NativeFrameCaptureScope &) = delete;
++
++ private:
++  NativeFrameCapture *previous_;
++};
++
++inline void formal_frame_mark_stage(const char *stage)
++{
++  if (bound_native_capture) {
++    std::fprintf(stderr, "READYFRAME frame=%d event=%s owner=%p\n", bound_native_capture->frame,
++                 stage, bound_native_capture->session.load());
++  }
++}
++
++class FormalFrame {
++ public:
++  FormalFrame(int frame, const string &path, std::shared_ptr<FormalFrame> predecessor = {});
++  ~FormalFrame();
++  bool wait_for_ready();
++  bool wait_for_sampling();
++  bool wait_for_finish();
++  bool take_previous_tree(Scene &scene, Progress &progress);
++  bool begin_sampling(Scene &scene, Progress &progress);
++  void sample_batch_begin();
++  void finish(bool success);
++  bool capture_done() const { return capture.completed.load(); }
++  void mark(const char *stage) const
++  {
++    std::fprintf(stderr, "READYFRAME frame=%d event=%s owner=%p\n", frame, stage, capture.session.load());
++  }
++
++  const int frame;
++  NativeFrameCapture capture;
++
++ private:
++  std::shared_ptr<FormalFrame> predecessor_;
++  std::unique_ptr<BVHFrameLookahead> retained_tree_;
++  std::mutex mutex_;
++  std::condition_variable changed_;
++  bool ready_ = false;
++  bool sampling_ = false;
++  bool finished_ = false;
++  bool success_ = false;
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/session/session.h b/intern/cycles/session/session.h
+--- a/intern/cycles/session/session.h
++++ b/intern/cycles/session/session.h
+@@ -12,6 +12,7 @@
+ #include "scene/stats.h"
+ #include "session/buffers.h"
+ #include "session/cache_eviction.h"
++#include "session/formal_frame.h"
+ #include "session/tile.h"
+ 
+ #include "util/progress.h"
+@@ -129,6 +130,7 @@
+   ~Session();
+ 
+   void start();
++  void set_formal_frame(std::shared_ptr<FormalFrame> frame);
+ 
+   /* When quick cancel is requested path tracing is cancels as soon as possible, without waiting
+    * for the buffer to be uniformly sampled. */
+@@ -203,7 +205,7 @@
+    * checking the pause. */
+   bool run_wait_for_work(const RenderWork &render_work);
+ 
+-  void run_main_render_loop();
++  void run_main_render_loop(FormalFrame *formal);
+ 
+   bool update_scene(const bool reset_samples);
+ 
+diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.cpp
+--- a/intern/cycles/session/session.cpp
++++ b/intern/cycles/session/session.cpp
+@@ -3,7 +3,9 @@
+  * SPDX-License-Identifier: Apache-2.0 */
+ 
+ #include <cstring>
+-
++#include <unordered_map>
++
++#include "bvh/bvh2.h"
+ #include "bvh/exact_frame.h"
+ #include "bvh/frame_lookahead.h"
+ #include "device/cpu/device.h"
+@@ -30,6 +32,137 @@
+ 
+ CCL_NAMESPACE_BEGIN
+ 
++namespace {
++std::mutex formal_sessions_mutex;
++std::unordered_map<const Session *, std::shared_ptr<FormalFrame>> formal_sessions;
++}
++
++FormalFrame::FormalFrame(const int frame_id, const string &path, std::shared_ptr<FormalFrame> predecessor)
++    : frame(frame_id), capture{frame_id, path, this}, predecessor_(std::move(predecessor))
++{
++}
++FormalFrame::~FormalFrame() = default;
++
++bool FormalFrame::wait_for_ready()
++{
++  std::unique_lock lock(mutex_);
++  changed_.wait(lock, [this] { return ready_ || finished_; });
++  return ready_;
++}
++
++bool FormalFrame::wait_for_sampling()
++{
++  std::unique_lock lock(mutex_);
++  changed_.wait(lock, [this] { return sampling_ || finished_; });
++  return sampling_;
++}
++
++bool FormalFrame::wait_for_finish()
++{
++  std::unique_lock lock(mutex_);
++  changed_.wait(lock, [this] { return finished_; });
++  return success_;
++}
++
++bool FormalFrame::take_previous_tree(Scene &scene, Progress &progress)
++{
++  if (!predecessor_) {
++    return true;
++  }
++  std::unique_lock lock(predecessor_->mutex_);
++  while (!predecessor_->ready_ && !predecessor_->finished_) {
++    predecessor_->changed_.wait_for(lock, std::chrono::milliseconds(20));
++    if (progress.get_cancel()) {
++      return false;
++    }
++  }
++  if (!predecessor_->ready_ || (predecessor_->finished_ && !predecessor_->success_)) {
++    progress.set_error("Previous frame did not prepare its scene");
++    return false;
++  }
++  scene.frame_lookahead = std::move(predecessor_->retained_tree_);
++  if (scene.frame_lookahead) {
++    mark("bvh_handoff");
++  }
++  return true;
++}
++
++bool FormalFrame::begin_sampling(Scene &scene, Progress &progress)
++{
++  {
++    std::lock_guard lock(mutex_);
++    if (finished_) {
++      return false;
++    }
++    /* The immutable device arrays have been populated by scene.update(). The
++     * builder's retained CPU nodes and input evidence are no longer read by
++     * this lane. Move their sole owner; the successor still verifies its own
++     * ordered references and retains its own device arrays. */
++    if (scene.frame_lookahead) {
++      if (scene.bvh && scene.bvh->params.bvh_layout == BVH_LAYOUT_BVH2) {
++        static_cast<BVH2 *>(scene.bvh.get())->frame_lookahead = nullptr;
++      }
++      retained_tree_ = std::move(scene.frame_lookahead);
++    }
++    ready_ = true;
++    mark("prepared");
++  }
++  changed_.notify_all();
++  if (auto pred = std::move(predecessor_)) {
++    std::unique_lock lock(pred->mutex_);
++    while (!pred->finished_) {
++      pred->changed_.wait_for(lock, std::chrono::milliseconds(20));
++      if (progress.get_cancel()) {
++        return false;
++      }
++    }
++    if (!pred->success_) {
++      progress.set_error("Previous prepared frame did not complete");
++      return false;
++    }
++  }
++  return !progress.get_cancel();
++}
++
++void FormalFrame::sample_batch_begin()
++{
++  std::lock_guard lock(mutex_);
++  if (!sampling_ && !finished_) {
++    sampling_ = true;
++    mark("sample_begin");
++    changed_.notify_all();
++  }
++}
++
++void FormalFrame::finish(const bool success)
++{
++  {
++    std::lock_guard lock(mutex_);
++    if (finished_) {
++      return;
++    }
++    success_ = success;
++    finished_ = true;
++    mark("lane_release");
++    if (!success_) {
++      mark("abort");
++    }
++  }
++  changed_.notify_all();
++}
++
++void Session::set_formal_frame(std::shared_ptr<FormalFrame> frame)
++{
++  std::lock_guard lock(formal_sessions_mutex);
++  if (frame) {
++    frame->capture.session.store(this);
++    formal_sessions[this] = std::move(frame);
++  }
++  else {
++    formal_sessions.erase(this);
++  }
++}
++
+ Session::Session(const SessionParams &params_, const SceneParams &scene_params)
+     : params(params_),
+       eviction_manager_(params_.background),
+@@ -97,6 +230,7 @@
+   /* Destroy session thread. */
+   session_thread_->join();
+   session_thread_.reset();
++  set_formal_frame(nullptr);
+ 
+   /* Destroy path tracer, before the device. This is needed because destruction might need to
+    * access device for device memory free.
+@@ -162,9 +296,10 @@
+   return path_trace_->ready_to_reset();
+ }
+ 
+-void Session::run_main_render_loop()
++void Session::run_main_render_loop(FormalFrame *formal)
+ {
+   path_trace_->zero_display();
++  bool started_sampling = false;
+ 
+   while (true) {
+     RenderWork render_work = run_update_for_next_iteration();
+@@ -209,6 +344,13 @@
+       break;
+     }
+ 
++    if (formal && !started_sampling && render_work.path_trace.num_samples > 0) {
++      if (!formal->begin_sampling(*scene, progress)) {
++        break;
++      }
++      started_sampling = true;
++    }
++
+     {
+       /* buffers mutex is locked entirely while rendering each
+        * sample, and released/reacquired on each iteration to allow
+@@ -281,6 +423,15 @@
+ 
+ void Session::thread_render()
+ {
++  std::shared_ptr<FormalFrame> formal;
++  {
++    std::lock_guard lock(formal_sessions_mutex);
++    const auto it = formal_sessions.find(this);
++    if (it != formal_sessions.end()) {
++      formal = it->second;
++    }
++  }
++  NativeFrameCaptureScope capture_scope(formal ? &formal->capture : nullptr);
+   if (params.use_profiling && (params.device.type == DEVICE_CPU)) {
+     profiler.start();
+   }
+@@ -289,11 +440,11 @@
+   progress.set_status("Waiting for render to start");
+ 
+   /* run */
+-  if (!progress.get_cancel()) {
++  if (!progress.get_cancel() && (!formal || formal->take_previous_tree(*scene, progress))) {
+     /* reset number of rendered samples */
+     progress.reset_sample();
+ 
+-    run_main_render_loop();
++    run_main_render_loop(formal.get());
+   }
+ 
+   profiler.stop();
+@@ -304,6 +455,9 @@
+   }
+   else {
+     progress.set_update();
++  }
++  if (formal) {
++    formal->finish(!progress.get_cancel() && !progress.get_error() && formal->capture_done());
+   }
+ }
+ 
+diff --git a/intern/cycles/session/tile.cpp b/intern/cycles/session/tile.cpp
+--- a/intern/cycles/session/tile.cpp
++++ b/intern/cycles/session/tile.cpp
+@@ -43,33 +43,52 @@
+ 
+ bool native_frame_is_capturing()
+ {
++  if (bound_native_capture) {
++    return true;
++  }
+   return native_frame_capturing.load(std::memory_order_relaxed);
+ }
+ 
+ bool native_frame_is_inline_reference()
+ {
++  if (bound_native_capture) {
++    return false;
++  }
+   return native_frame_inline_reference.load(std::memory_order_relaxed);
+ }
+ 
+ string native_frame_capture_path()
+ {
++  if (bound_native_capture) {
++    return bound_native_capture->path;
++  }
+   std::lock_guard<std::mutex> lock(native_frame_mutex);
+   return native_frame_capture;
+ }
+ 
+ string native_frame_replay_path()
+ {
++  if (bound_native_capture) {
++    return {};
++  }
+   std::lock_guard<std::mutex> lock(native_frame_mutex);
+   return native_frame_replay;
+ }
+ 
+ void native_frame_mark_complete()
+ {
++  if (bound_native_capture) {
++    bound_native_capture->completed.store(true);
++    return;
++  }
+   native_frame_completed.store(true);
+ }
+ 
+ bool native_frame_complete()
+ {
++  if (bound_native_capture) {
++    return bound_native_capture->completed.load();
++  }
+   return native_frame_completed.load();
+ }
+ 
+@@ -668,6 +687,7 @@
+   if (native_frame_is_capturing()) {
+     if (closed && write_state_.num_tiles_written == tile_state_.num_tiles) {
+       native_frame_mark_complete();
++      formal_frame_mark_stage("film_ready");
+     }
+   }
+   else if (full_buffer_written_cb) {
+diff --git a/intern/cycles/bvh/bvh2.cpp b/intern/cycles/bvh/bvh2.cpp
+--- a/intern/cycles/bvh/bvh2.cpp
++++ b/intern/cycles/bvh/bvh2.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ 
+ #include "bvh/bvh2.h"
++#include "session/formal_frame.h"
+ 
+ #include "scene/hair.h"
+ #include "scene/mesh.h"
+@@ -76,6 +77,7 @@
+   progress.set_substatus("Packing BVH nodes");
+   pack_nodes(root.get());
+   if (params.top_level) {
++    formal_frame_mark_stage("bvh_packed");
+     BVHExactFrames::audit(pack);
+     if (frame_lookahead) {
+       frame_lookahead->keep_tree(root);
+diff --git a/intern/cycles/bvh/exact_frame.cpp b/intern/cycles/bvh/exact_frame.cpp
+--- a/intern/cycles/bvh/exact_frame.cpp
++++ b/intern/cycles/bvh/exact_frame.cpp
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: Apache-2.0 */
+ #include "bvh/exact_frame.h"
++#include "session/formal_frame.h"
+ #include "bvh/binning.h"
+ #include "bvh/build.h"
+ #include "bvh/bvh.h"
+@@ -801,6 +802,7 @@
+                                                      builder.object_visibility(ref.prim_object()));
+   };
+   if (previous && previous->root && verify_evidence(previous->original, info, input)) {
++    formal_frame_mark_stage("bvh_verified");
+     /* The original unsorted inputs, root and all masks match exactly. */
+     unique_ptr<BVHNode> root = std::move(previous->root);
+     if (keep) {
+@@ -829,6 +831,7 @@
+   if (keep) {
+     save_evidence(current->original, info, 0, input);
+   }
++  formal_frame_mark_stage(previous ? "bvh_inputs_changed" : "bvh_cold");
+   current->partitions.state_->record = keep;
+   use_partitions(builder, *current, previous.get());
+   unique_ptr<BVHNode> result = builder.build_references(range);
+diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/path_trace.cpp
+--- a/intern/cycles/integrator/path_trace.cpp
++++ b/intern/cycles/integrator/path_trace.cpp
+@@ -16,6 +16,7 @@
+ #include "scene/scene.h"
+ 
+ #include "session/display_driver.h"
++#include "session/formal_frame.h"
+ #include "session/tile.h"
+ 
+ #include "util/log.h"
+@@ -215,7 +216,13 @@
+     render_scheduler_.set_limit_samples_per_update(limit);
+   }
+ 
++  if (bound_native_capture && render_work.path_trace.num_samples > 0) {
++    bound_native_capture->job->sample_batch_begin();
++  }
+   path_trace(render_work);
++  if (bound_native_capture && render_work.path_trace.num_samples > 0) {
++    formal_frame_mark_stage("sample_batch_end");
++  }
+   if (render_cancel_.is_requested) {
+     return;
+   }
+@@ -1008,6 +1015,7 @@
+     /* The tile has zero samples, no need to write it. */
+     return;
+   }
++  formal_frame_mark_stage("film_readback_begin");
+ 
+   /* Get access to the CPU-side render buffers of the current big tile. */
+   RenderBuffers *buffers;
+--- a/intern/cycles/blender/session.h
++++ b/intern/cycles/blender/session.h
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: Apache-2.0 */
+ 
+ #pragma once
++
++#include <memory>
+ 
+ #include "device/device.h"
+ 
+@@ -30,6 +32,7 @@
+ 
+ class BlenderDisplayDriver;
+ class BlenderSync;
++class FormalFrame;
+ class ImageMetaData;
+ class Scene;
+ class Session;
+@@ -62,6 +65,10 @@
+   void render(blender::Depsgraph &b_depsgraph);
+ 
+   void render_frame_finish();
++
++  static string formal_begin(int frame, const string &capture);
++  static string formal_collect(int frame);
++  static void formal_end();
+ 
+   void bake(blender::Depsgraph &b_depsgraph_,
+             blender::Object &b_object,
+@@ -160,6 +167,11 @@
+ 
+   vector<string> full_buffer_files_;
+ 
++  /* The inactive host scene accumulates depsgraph recalc flags for the next time it is used. */
++  unique_ptr<Session> other_session_;
++  unique_ptr<BlenderSync> other_sync_;
++  std::shared_ptr<FormalFrame> formal_request_;
++
+   int bake_id = 0;
+ };
+ 
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: Apache-2.0 */
+ 
+ #include <cstdlib>
++#include <map>
+ 
+ #include "BLI_path_utils.hh"
+ #include "DEG_depsgraph_query.hh"
+@@ -46,6 +47,67 @@
+ DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
+ bool BlenderSession::headless = false;
+ bool BlenderSession::print_render_stats = false;
++
++/* The bpy render calls are sequential. Only the isolated Cycles session workers overlap. */
++static struct {
++  BlenderSession *owner = nullptr;
++  std::shared_ptr<FormalFrame> request;
++  std::map<int, std::shared_ptr<FormalFrame>> frames;
++  bool submitted = false;
++} formal_batch;
++
++string BlenderSession::formal_begin(const int frame, const string &capture)
++{
++  if (capture.empty() || formal_batch.frames.count(frame) ||
++      (formal_batch.request && !formal_batch.submitted)) {
++    return "Invalid formal frame or previous render was not submitted";
++  }
++  auto next = std::make_shared<FormalFrame>(frame, capture, formal_batch.request);
++  formal_batch.frames.emplace(frame, next);
++  formal_batch.request = std::move(next);
++  formal_batch.submitted = false;
++  native_frame_set_paths(capture, "", false);
++  return "";
++}
++
++string BlenderSession::formal_collect(const int frame)
++{
++  const auto found = formal_batch.frames.find(frame);
++  if (found == formal_batch.frames.end()) {
++    return "Unknown or already collected formal frame";
++  }
++  if (found->second == formal_batch.request && !formal_batch.submitted) {
++    return "The formal frame was not submitted by the render engine";
++  }
++  const bool ok = found->second->wait_for_finish();
++  formal_batch.frames.erase(found);
++  return ok ? "" : string_printf("Cycles failed to complete formal frame %d", frame);
++}
++
++void BlenderSession::formal_end()
++{
++  if (!formal_batch.request) {
++    return;
++  }
++  if (!formal_batch.submitted) {
++    formal_batch.request->finish(false);
++  }
++  if (BlenderSession *owner = formal_batch.owner) {
++    if (owner->session) {
++      owner->session->wait();
++    }
++    if (owner->other_session_) {
++      owner->other_session_->wait();
++    }
++    owner->other_sync_.reset();
++    owner->other_session_.reset();
++    owner->free_session();
++    owner->scene = nullptr;
++    owner->formal_request_.reset();
++  }
++  formal_batch = {};
++  native_frame_set_paths("", "", false);
++}
+ 
+ BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
+                                blender::UserDef &b_userpref,
+@@ -115,6 +177,9 @@
+ 
+ BlenderSession::~BlenderSession()
+ {
++  if (formal_batch.owner == this) {
++    formal_end();
++  }
+   free_session();
+ }
+ 
+@@ -169,10 +234,34 @@
+ 
+ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_depsgraph)
+ {
++  if (formal_batch.request && !b_v3d && background) {
++    if (formal_batch.owner && formal_batch.owner != this) {
++      RE_engine_report(&b_engine, 1 << 5, "Formal rendering requires one persistent render engine");
++      return;
++    }
++    formal_batch.owner = this;
++    if (formal_request_ != formal_batch.request) {
++      if (formal_request_) {
++        session.swap(other_session_);
++        sync.swap(other_sync_);
++        if (session) {
++          session->wait();
++        }
++        scene = session ? session->scene.get() : nullptr;
++      }
++      formal_request_ = formal_batch.request;
++    }
++  }
+   /* Update data, scene and depsgraph pointers. These can change after undo. */
+   this->b_data = &b_data;
+   this->b_depsgraph = &b_depsgraph;
+   this->b_scene = DEG_get_evaluated_scene(&b_depsgraph);
++  if (formal_request_ && other_sync_) {
++    /* Collect this frame's invalidations for the scene that rendered N-1 as well. Only
++     * the current lane performs sync_data(). The parked lane's Cycles nodes stay untouched. */
++    other_sync_->reset(b_data, *this->b_scene);
++    other_sync_->sync_recalc(b_depsgraph, b_screen, b_v3d, b_rv3d);
++  }
+   if (sync) {
+     sync->reset(*this->b_data, *this->b_scene);
+   }
+@@ -341,14 +430,32 @@
+ {
+   b_depsgraph = &b_depsgraph_;
+ 
++  if (formal_batch.request && (formal_request_ != formal_batch.request || !session)) {
++    RE_engine_report(&b_engine, 1 << 5, "Formal frame has no synchronized render session");
++    return;
++  }
++  if (formal_request_) {
++    formal_request_->mark("scene_eval");
++  }
+   if (session->progress.get_cancel()) {
+     update_status_progress();
+     return;
+   }
+ 
+   /* Create driver to write out render results. */
+-  ensure_display_driver_if_needed();
+-  session->set_output_driver(make_unique<BlenderOutputDriver>(b_engine));
++  if (formal_request_) {
++    /* The capture worker only writes its private film. It must never call back into the
++     * Blender render result after this invocation returns. */
++    session->progress.set_update_callback({});
++    session->progress.set_cancel_callback({});
++    session->set_display_driver(nullptr);
++    session->set_output_driver(nullptr);
++    session->full_buffer_written_cb = nullptr;
++  }
++  else {
++    ensure_display_driver_if_needed();
++    session->set_output_driver(make_unique<BlenderOutputDriver>(b_engine));
++  }
+ 
+   const string replay = native_frame_replay_path();
+   if (!replay.empty()) {
+@@ -357,7 +464,9 @@
+     return;
+   }
+ 
+-  session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
++  if (!formal_request_) {
++    session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
++  }
+ 
+   blender::ViewLayer &b_view_layer = *DEG_get_evaluated_view_layer(b_depsgraph);
+ 
+@@ -384,6 +493,12 @@
+   sync->sync_render_passes(*b_rlay, b_view_layer);
+ 
+   const int num_views = b_rr->views.count();
++  if (formal_request_ && (num_views != 1 || formal_batch.submitted ||
++                          (b_render->mode & blender::R_PERSISTENT_DATA) == 0)) {
++    RE_engine_end_result(&b_engine, b_rr, true, false, false);
++    RE_engine_report(&b_engine, 1 << 5, "Formal capture requires one view, one layer and persistent data");
++    return;
++  }
+ 
+   for (const auto [view_index, b_view] : b_rr->views.enumerate()) {
+     b_rview_name = b_view.name;
+@@ -477,6 +592,20 @@
+       scene->enable_update_stats();
+     }
+ 
++    if (formal_request_) {
++      session->set_formal_frame(formal_request_);
++      session->start();
++      formal_batch.submitted = true;
++      /* All Blender-facing sync and scene/device preparation must finish before allowing
++       * the host to evaluate another frame. Sampling stays on this lane's own Session. */
++      if (!formal_request_->wait_for_ready()) {
++        if (!check_and_report_session_error()) {
++          RE_engine_report(&b_engine, 1 << 5, "Formal frame could not reach its sampling boundary");
++        }
++      }
++      RE_engine_end_result(&b_engine, b_rr, true, false, false);
++      return;
++    }
+     session->start();
+     session->wait();
+ 
+@@ -511,6 +640,9 @@
+ 
+ void BlenderSession::render_frame_finish()
+ {
++  if (formal_request_) {
++    return;
++  }
+   /* Processing of all layers and views is done. Clear the strings so that we can communicate
+    * progress about reading files and denoising them. */
+   b_rlay_name = "";
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -524,6 +524,46 @@
+ static PyObject *native_frame_done_func(PyObject * /*self*/, PyObject * /*args*/)
+ {
+   return PyBool_FromLong(native_frame_complete());
++}
++
++static PyObject *formal_begin_func(PyObject * /*self*/, PyObject *args)
++{
++  int frame;
++  const char *path;
++  if (!PyArg_ParseTuple(args, "is", &frame, &path)) {
++    return nullptr;
++  }
++  const string error = BlenderSession::formal_begin(frame, path);
++  if (!error.empty()) {
++    PyErr_SetString(PyExc_RuntimeError, error.c_str());
++    return nullptr;
++  }
++  Py_RETURN_NONE;
++}
++
++static PyObject *formal_collect_func(PyObject * /*self*/, PyObject *args)
++{
++  int frame;
++  if (!PyArg_ParseTuple(args, "i", &frame)) {
++    return nullptr;
++  }
++  string error;
++  Py_BEGIN_ALLOW_THREADS
++  error = BlenderSession::formal_collect(frame);
++  Py_END_ALLOW_THREADS
++  if (!error.empty()) {
++    PyErr_SetString(PyExc_RuntimeError, error.c_str());
++    return nullptr;
++  }
++  Py_RETURN_NONE;
++}
++
++static PyObject *formal_end_func(PyObject * /*self*/, PyObject * /*args*/)
++{
++  Py_BEGIN_ALLOW_THREADS
++  BlenderSession::formal_end();
++  Py_END_ALLOW_THREADS
++  Py_RETURN_NONE;
+ }
+ 
+ static PyObject *denoise_func(PyObject * /*self*/, PyObject *args, PyObject *keywords)
+@@ -862,6 +902,9 @@
+     /* Standalone denoising */
+     {"denoise", (PyCFunction)denoise_func, METH_VARARGS | METH_KEYWORDS, ""},
+     {"native_frame_paths", native_frame_paths_func, METH_VARARGS, ""},
++    {"formal_begin", formal_begin_func, METH_VARARGS, ""},
++    {"formal_collect", formal_collect_func, METH_VARARGS, ""},
++    {"formal_end", formal_end_func, METH_NOARGS, ""},
+     {"native_frame_done", native_frame_done_func, METH_NOARGS, ""},
+     {"merge", (PyCFunction)merge_func, METH_VARARGS | METH_KEYWORDS, ""},
+ 

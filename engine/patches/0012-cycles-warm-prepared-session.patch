@@ -1,0 +1,248 @@
+--- a/intern/cycles/blender/sync.h
++++ b/intern/cycles/blender/sync.h
+@@ -69,7 +69,8 @@
+                  const int width,
+                  const int height,
+                  void **python_thread_state,
+-                 const DeviceInfo &denoise_device_info);
++                 const DeviceInfo &denoise_device_info,
++                 bool bootstrap_host_map = false);
+   void sync_view_layer(blender::ViewLayer &b_view_layer);
+   void sync_render_passes(blender::RenderLayer &b_rlay, blender::ViewLayer &b_view_layer);
+   void sync_integrator(blender::ViewLayer &b_view_layer,
+--- a/intern/cycles/blender/sync.cpp
++++ b/intern/cycles/blender/sync.cpp
+@@ -302,7 +302,8 @@
+                             const int width,
+                             const int height,
+                             void **python_thread_state,
+-                            const DeviceInfo &denoise_device_info)
++                            const DeviceInfo &denoise_device_info,
++                            const bool bootstrap_host_map)
+ {
+   /* For auto refresh images. */
+   ImageManager *image_manager = scene->image_manager.get();
+@@ -336,8 +337,15 @@
+ 
+   geometry_synced.clear(); /* use for objects and motion sync */
+ 
+-  sync_objects_and_motion(
+-      b_render, b_depsgraph, b_screen, b_v3d, b_rv3d, width, height, python_thread_state);
++  if (bootstrap_host_map) {
++    /* Both Cycles lanes must inherit the same first-frame insertion order. This reads
++     * the already-evaluated center graph. Motion samples belong to official renders. */
++    sync_objects(b_depsgraph, b_screen, b_v3d);
++  }
++  else {
++    sync_objects_and_motion(
++        b_render, b_depsgraph, b_screen, b_v3d, b_rv3d, width, height, python_thread_state);
++  }
+ 
+   geometry_synced.clear();
+ 
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -37,6 +37,7 @@
+ #include "util/time.h"
+ 
+ #include "blender/display_driver.h"
++#include "blender/image.h"
+ #include "blender/output_driver.h"
+ #include "blender/session.h"
+ #include "blender/sync.h"
+@@ -603,6 +604,29 @@
+           RE_engine_report(&b_engine, 1 << 5, "Formal frame could not reach its sampling boundary");
+         }
+       }
++      else if (!other_session_ && blender::BLI_getenv("CYCLES_FRAMEPIPE_LAST") &&
++               string(blender::BLI_getenv("CYCLES_FRAMEPIPE_LAST")) != "1" &&
++               formal_request_->wait_for_sampling()) {
++        formal_request_->mark("bootstrap_sync_begin");
++        other_session_ = make_unique<Session>(session_params, scene->params);
++        Scene *seed_scene = other_session_->scene.get();
++        seed_scene->name = scene->name;
++        other_sync_ = make_unique<BlenderSync>(b_engine,
++                                              *b_data,
++                                              *b_scene,
++                                              seed_scene,
++                                              false,
++                                              use_developer_ui,
++                                              other_session_->progress);
++        other_sync_->sync_render_passes(*b_rlay, b_view_layer);
++        other_sync_->sync_camera(*b_render, width, height, b_rview_name.c_str());
++        other_sync_->sync_data(*b_render, *b_depsgraph, b_screen, b_v3d, b_rv3d,
++                               width, height, &python_thread_state,
++                               session_params.denoise_device, true);
++        seed_scene->image_manager->warm_packed_stills(*other_session_->device, *seed_scene, *scene,
++                                                     BlenderImageLoader::same_packed_still);
++        formal_request_->mark("bootstrap_sync_end");
++      }
+       RE_engine_end_result(&b_engine, b_rr, true, false, false);
+       return;
+     }
+--- a/intern/cycles/blender/image.h
++++ b/intern/cycles/blender/image.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include "DNA_image_types.h"
++#include "BLI_implicit_sharing_ptr.hh"
+ 
+ #include "scene/image_loader.h"
+ #include "scene/image_vdb.h"
+@@ -37,6 +38,8 @@
+   blender::ImageUser b_iuser;
+   bool free_cache;
+   uint64_t cached_update_count;
++  blender::ImplicitSharingPtr<> packed_version;
++  static bool same_packed_still(const ImageLoader &a, const ImageLoader &b);
+ };
+ 
+ CCL_NAMESPACE_END
+--- a/intern/cycles/blender/image.cpp
++++ b/intern/cycles/blender/image.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ 
+ #include "DNA_image_types.h"
++#include "DNA_packedFile_types.h"
+ 
+ #include "IMB_imbuf_types.hh"
+ 
+@@ -33,6 +34,14 @@
+       cached_update_count(b_image->runtime->update_count)
+ {
+   this->b_iuser.framenr = frame;
++  if (b_image->source == blender::IMA_SRC_FILE && b_image->packedfiles.first &&
++      b_image->packedfiles.first == b_image->packedfiles.last) {
++    const auto *file = static_cast<const blender::ImagePackedFile *>(b_image->packedfiles.first)->packedfile;
++    if (file && file->sharing_info && !BKE_image_is_dirty(b_image)) {
++      file->sharing_info->add_user();
++      packed_version = blender::ImplicitSharingPtr<>(file->sharing_info);
++    }
++  }
+   if (b_image->source != blender::IMA_SRC_TILED) {
+     /* Image sequences currently not supported by this image loader. */
+     assert(b_image->source != blender::IMA_SRC_SEQUENCE);
+@@ -239,6 +248,20 @@
+          cached_update_count == other_loader.cached_update_count;
+ }
+ 
++bool BlenderImageLoader::same_packed_still(const ImageLoader &a, const ImageLoader &b)
++{
++  const auto *left = dynamic_cast<const BlenderImageLoader *>(&a);
++  const auto *right = dynamic_cast<const BlenderImageLoader *>(&b);
++  if (!left || !right || !left->packed_version.get() ||
++      left->packed_version.get() != right->packed_version.get() || !left->equals(*right)) {
++    return false;
++  }
++  return left->cached_update_count == left->b_image->runtime->update_count &&
++         left->b_iuser.pass == right->b_iuser.pass && left->b_iuser.layer == right->b_iuser.layer &&
++         left->b_iuser.view == right->b_iuser.view && left->b_iuser.multi_index == right->b_iuser.multi_index &&
++         left->b_iuser.multiview_eye == right->b_iuser.multiview_eye && !BKE_image_is_dirty(left->b_image);
++}
++
+ int BlenderImageLoader::get_tile_number() const
+ {
+   return b_iuser.tile;
+--- a/intern/cycles/scene/image_cache.h
++++ b/intern/cycles/scene/image_cache.h
+@@ -116,6 +116,8 @@
+                                 const ImageMetaData &metadata,
+                                 const float texture_resolution,
+                                 KernelImageTexture &tex);
++
++  device_image *clone_full(Device &device, const device_image &source, uint &image_info_id);
+ 
+   void load_image_tiled(const ImageMetaData &metadata, KernelImageTexture &tex);
+ 
+--- a/intern/cycles/scene/image_cache.cpp
++++ b/intern/cycles/scene/image_cache.cpp
+@@ -146,6 +146,20 @@
+   deferred_updates.insert(&mem);
+ 
+   return mem;
++}
++
++device_image *ImageCache::clone_full(Device &device, const device_image &source, uint &image_info_id)
++{
++  device_image &copy = alloc_full(device,
++                                  ImageDataType(source.info.data_type),
++                                  InterpolationType(source.info.interpolation),
++                                  ExtensionType(source.info.extension),
++                                  source.data_width, source.data_height, image_info_id);
++  if (!copy.host_pointer) {
++    return nullptr;
++  }
++  memcpy(copy.host_pointer, source.host_pointer, copy.memory_size());
++  return &copy;
+ }
+ 
+ void ImageCache::free_full(const uint image_info_id)
+--- a/intern/cycles/scene/image.h
++++ b/intern/cycles/scene/image.h
+@@ -172,6 +172,8 @@
+                           const set<const ImageSingle *> &images);
+ 
+   bool set_animation_frame_update(const int frame);
++  void warm_packed_stills(Device &device, Scene &scene, Scene &source_scene,
++                          bool (*same_source)(const ImageLoader &, const ImageLoader &));
+ 
+   void evict_unused(Device *device, Scene *scene);
+ 
+--- a/intern/cycles/scene/image.cpp
++++ b/intern/cycles/scene/image.cpp
+@@ -520,6 +520,53 @@
+   /* Cleanup memory in image loader. */
+   img->loader->cleanup();
+   img->need_load = false;
++}
++
++void ImageManager::warm_packed_stills(Device &device, Scene &scene, Scene &source_scene,
++                                      bool (*same_source)(const ImageLoader &, const ImageLoader &))
++{
++  if (scene.params.texture_resolution != source_scene.params.texture_resolution ||
++      scene.params.texture_limit != source_scene.params.texture_limit ||
++      scene.params.use_texture_cache != source_scene.params.use_texture_cache) {
++    return;
++  }
++  ImageManager &source = *source_scene.image_manager;
++  device_resize_image_textures(&scene);
++  size_t count = 0, bytes = 0;
++  for (ImageSingle *dst : images) {
++    if (!dst || !dst->need_load || dst->params.animated || !dst->builtin) {
++      continue;
++    }
++    for (const ImageSingle *orig : source.images) {
++      if (!orig || orig->need_load || orig->need_metadata || !orig->builtin ||
++          !(orig->params == dst->params) || !orig->vdb_memory || !orig->vdb_memory->host_pointer ||
++          !same_source(*dst->loader, *orig->loader) ||
++          (!dst->need_metadata && !(dst->metadata == orig->metadata))) {
++        continue;
++      }
++      KernelImageTexture tex = source_scene.dscene.image_textures[orig->image_texture_id];
++      if (tex.tile_descriptor_offset != KERNEL_TILE_LOAD_NONE || orig->metadata.use_transform_3d) {
++        continue;
++      }
++      uint index;
++      device_image *copy = image_cache.clone_full(device, *orig->vdb_memory, index);
++      if (!copy) {
++        device.set_error("Unable to allocate a private copy of a formal packed texture");
++        return;
++      }
++      tex.image_info_id = index;
++      dst->vdb_memory = copy;
++      dst->metadata = orig->metadata;
++      dst->need_metadata = false;
++      dst->need_load = false;
++      scene.dscene.image_textures[dst->image_texture_id] = tex;
++      scene.dscene.image_textures.tag_modified();
++      ++count;
++      bytes += copy->memory_size();
++      break;
++    }
++  }
++  std::fprintf(stderr, "READYFRAME_PACKED_STILLS reused=%zu bytes=%zu\n", count, bytes);
+ }
+ 
+ void ImageManager::device_load_tiled_descriptors(Scene *scene)

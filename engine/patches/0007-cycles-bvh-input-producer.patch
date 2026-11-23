@@ -1,0 +1,283 @@
+diff --git a/intern/cycles/blender/session.cpp b/intern/cycles/blender/session.cpp
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -4,11 +4,13 @@
+ 
+ #include <cstdlib>
+ 
++#include "BLI_path_utils.hh"
+ #include "DEG_depsgraph_query.hh"
+ #include "DNA_screen_types.h"
+ #include "DNA_space_types.h"
+ #include "RNA_prototypes.hh"
+ 
++#include "bvh/exact_frame.h"
+ #include "device/device.h"
+ 
+ #include "scene/background.h"
+@@ -400,16 +402,35 @@
+     }
+ 
+     /* update scene */
+-    sync->sync_camera(*b_render, width, height, b_rview_name.c_str());
+-    sync->sync_data(*b_render,
+-                    *b_depsgraph,
+-                    b_screen,
+-                    b_v3d,
+-                    b_rv3d,
+-                    width,
+-                    height,
+-                    &python_thread_state,
+-                    session_params.denoise_device);
++    auto sync_view = [&] {
++      sync->sync_camera(*b_render, width, height, b_rview_name.c_str());
++      sync->sync_data(*b_render,
++                      *b_depsgraph,
++                      b_screen,
++                      b_v3d,
++                      b_rv3d,
++                      width,
++                      height,
++                      &python_thread_state,
++                      session_params.denoise_device);
++    };
++    sync_view();
++    if (BVHExactFrames::producing()) {
++      /* The main persistent session synchronizes N before N+1. Populate the
++       * same object map at N, then evaluate the future frame in this render
++       * graph without changing the production graph or launching a sample. */
++      const char *target = blender::BLI_getenv("CYCLES_FRAMEPIPE_PRODUCE_FRAME");
++      const int next = target ? std::atoi(target) : b_scene->r.cfra;
++      if (next != b_scene->r.cfra) {
++        python_thread_state_restore(&python_thread_state);
++        RE_engine_frame_set(&b_engine, next, 0.0f);
++        python_thread_state_save(&python_thread_state);
++        b_scene = DEG_get_evaluated_scene(b_depsgraph);
++        sync->reset(*b_data, *b_scene);
++        sync->sync_recalc(*b_depsgraph, b_screen, b_v3d, b_rv3d);
++        sync_view();
++      }
++    }
+ 
+     /* At the moment we only free if we are not doing multi-view
+      * (or if we are rendering the last view). See #58142/D4239 for discussion.
+@@ -419,13 +440,15 @@
+       sync->free_data_after_sync(*b_depsgraph);
+     }
+ 
+-    builtin_images_load();
+-
+-    /* Attempt to free all data which is held by Blender side, since at this
+-     * point we know that we've got everything to render current view layer.
+-     */
+-    if (can_free_cache) {
+-      free_blender_memory_if_possible();
++    if (!BVHExactFrames::producing()) {
++      builtin_images_load();
++
++      /* Input capture only needs the images used by displacement, strand and volume
++       * geometry. Its geometry manager loads them on demand from the live depsgraph.
++       * For normal rendering all builtin images must be loaded before releasing it. */
++      if (can_free_cache) {
++        free_blender_memory_if_possible();
++      }
+     }
+ 
+     /* Make sure all views have different noise patterns. - hardcoded value just to make it
+diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.cpp
+--- a/intern/cycles/session/session.cpp
++++ b/intern/cycles/session/session.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <cstring>
+ 
++#include "bvh/exact_frame.h"
+ #include "bvh/frame_lookahead.h"
+ #include "device/cpu/device.h"
+ #include "device/device.h"
+@@ -323,6 +324,10 @@
+ 
+   /* Update scene */
+   const bool reset_scene = update_scene(delayed_reset_.do_reset);
++  if (BVHExactFrames::producing()) {
++    /* Input capture has no tiles, sampling, denoising or frame output. */
++    return render_work;
++  }
+ 
+   /* Update buffers for new parameters. After scene update which influences the passes used. */
+   bool have_tiles = true;
+diff --git a/intern/cycles/scene/geometry_bvh.cpp b/intern/cycles/scene/geometry_bvh.cpp
+--- a/intern/cycles/scene/geometry_bvh.cpp
++++ b/intern/cycles/scene/geometry_bvh.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "bvh/bvh.h"
+ #include "bvh/bvh2.h"
++#include "bvh/exact_frame.h"
+ #include "bvh/frame_lookahead.h"
+ #include "bvh/params.h"
+ 
+@@ -39,6 +40,11 @@
+ 
+   const BVHLayout bvh_layout = BVHParams::best_bvh_layout(
+       params->bvh_layout, device->get_bvh_layout_mask(dscene->data.kernel_features));
++  /* The input producer needs geometry bounds and the original instance flags for
++   * the top-level references, but never traces a ray through an object-level BVH. */
++  if (bvh_layout == BVH_LAYOUT_BVH2 && BVHExactFrames::producing()) {
++    return;
++  }
+   if (need_build_bvh(bvh_layout)) {
+     string msg = "Updating Geometry BVH ";
+     if (name.empty()) {
+diff --git a/source/blender/render/intern/engine.cc b/source/blender/render/intern/engine.cc
+--- a/source/blender/render/intern/engine.cc
++++ b/source/blender/render/intern/engine.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "BLI_listbase.h"
+ #include "BLI_math_bits.h"
++#include "BLI_path_utils.hh"
+ #include "BLI_string.h"
+ #include "BLI_utildefines.h"
+ 
+@@ -22,6 +23,7 @@
+ 
+ #include "BKE_camera.h"
+ #include "BKE_global.hh"
++#include "BKE_layer.hh"
+ #include "BKE_node.hh"
+ #include "BKE_report.hh"
+ #include "BKE_scene.hh"
+@@ -667,6 +669,22 @@
+ }
+ 
+ /* Depsgraph */
++static void engine_graph_evaluate_frame(Depsgraph *depsgraph)
++{
++  if (BLI_getenv("CYCLES_FRAMEPIPE_PRODUCE")) {
++    /* Speculative evaluation must not run production frame-change handlers or
++     * write evaluated values back to original datablocks. Keep recalc on the
++     * private graph for BlenderSync, just as the regular render path does. */
++    BKE_main_view_layers_synced_ensure(DEG_get_bmain(depsgraph));
++    DEG_graph_relations_update(depsgraph);
++    DEG_evaluate_on_framechange(depsgraph,
++                                BKE_scene_frame_get(DEG_get_input_scene(depsgraph)),
++                                DEG_EVALUATE_SYNC_WRITEBACK_NO);
++    return;
++  }
++  BKE_scene_graph_update_for_newframe_ex(depsgraph, false);
++}
++
+ static void engine_depsgraph_init(RenderEngine *engine, ViewLayer *view_layer)
+ {
+   Main *bmain = engine->re->main;
+@@ -694,7 +712,11 @@
+   if (!engine->depsgraph) {
+     /* Ensure we only use persistent data for one scene / view layer at a time,
+      * to avoid excessive memory usage. */
+-    RE_FreePersistentData(nullptr);
++    /* A BVH input capture owns a temporary render engine. The production engine
++     * still owns the last frame and any asynchronous work in its Cycles session. */
++    if (!BLI_getenv("CYCLES_FRAMEPIPE_PRODUCE")) {
++      RE_FreePersistentData(nullptr);
++    }
+ 
+     /* Create new depsgraph if not cached with persistent data. */
+     engine->depsgraph = DEG_graph_new(bmain, scene, view_layer, DAG_EVAL_RENDER);
+@@ -720,7 +742,7 @@
+   }
+   else {
+     /* Go through update with full Python callbacks for regular render. */
+-    BKE_scene_graph_update_for_newframe_ex(engine->depsgraph, false);
++    engine_graph_evaluate_frame(engine->depsgraph);
+   }
+ 
+   engine->has_grease_pencil = DRW_render_check_grease_pencil(engine->depsgraph);
+@@ -755,7 +777,7 @@
+ 
+   CLAMP(cfra, MINAFRAME, MAXFRAME);
+   BKE_scene_frame_set(re->scene, cfra);
+-  BKE_scene_graph_update_for_newframe_ex(engine->depsgraph, false);
++  engine_graph_evaluate_frame(engine->depsgraph);
+ 
+   BKE_scene_camera_switch_update(re->scene);
+ }
+diff --git a/source/blender/editors/render/render_internal.cc b/source/blender/editors/render/render_internal.cc
+--- a/source/blender/editors/render/render_internal.cc
++++ b/source/blender/editors/render/render_internal.cc
+@@ -13,6 +13,7 @@
+ 
+ #include "BLI_listbase.h"
+ #include "BLI_math_base.hh"
++#include "BLI_path_utils.hh"
+ #include "BLI_rect.h"
+ #include "BLI_string_utf8.h"
+ #include "BLI_string_utils.hh"
+@@ -294,12 +295,22 @@
+     return OPERATOR_CANCELLED;
+   }
+ 
+-  re = RE_NewSceneRender(scene);
++  const bool bvh_capture = BLI_getenv("CYCLES_FRAMEPIPE_PRODUCE") != nullptr;
++  int bvh_capture_owner;
++  re = bvh_capture ? RE_NewRender(&bvh_capture_owner) : RE_NewSceneRender(scene);
+ 
+   G.is_break = false;
+ 
+   RE_draw_lock_cb(re, nullptr, nullptr);
+   RE_test_break_cb(re, nullptr, render_break);
++
++  if (bvh_capture) {
++    /* Keep the original scene ID, with separate engine state and result ownership. */
++    RE_SetReports(re, op->reports);
++    RE_RenderFrame(re, mainp, scene, single_layer, camera_override, scene->r.cfra, 0.0f, false);
++    RE_FreeRender(re);
++    return G.is_break ? OPERATOR_CANCELLED : OPERATOR_FINISHED;
++  }
+ 
+   ima = BKE_image_ensure_viewer(mainp, IMA_TYPE_R_RESULT, "Render Result");
+   BKE_image_signal(mainp, ima, nullptr, IMA_SIGNAL_FREE);
+diff --git a/source/blender/render/intern/pipeline.cc b/source/blender/render/intern/pipeline.cc
+--- a/source/blender/render/intern/pipeline.cc
++++ b/source/blender/render/intern/pipeline.cc
+@@ -31,6 +31,7 @@
+ #include "BLI_listbase.h"
+ #include "BLI_map.hh"
+ #include "BLI_mutex.hh"
++#include "BLI_path_utils.hh"
+ #include "BLI_rect.h"
+ #include "BLI_set.hh"
+ #include "BLI_string_utf8.h"
+@@ -1933,6 +1934,32 @@
+ {
+   CLOG_INFO(&LOG, "Rendering frame %d", frame);
+ 
++  if (BLI_getenv("CYCLES_FRAMEPIPE_PRODUCE")) {
++    /* A BVH input capture needs camera selection and the native render dependency
++     * graph. It has no production frame callbacks, compositing or output. */
++    const bool saved_rendering = G.is_rendering;
++    const int saved_frame = scene->r.cfra;
++    const float saved_subframe = scene->r.subframe;
++    Object *saved_camera = scene->camera;
++    G.is_rendering = true;
++    scene->r.cfra = frame;
++    scene->r.subframe = subframe;
++    if (render_init_from_main(
++            re, &scene->r, bmain, scene, single_layer, camera_override, false, false))
++    {
++      re->r.mode &= ~R_PERSISTENT_DATA;
++      render_init_depsgraph(re);
++      BKE_scene_camera_switch_update(scene);
++      do_render_engine(re);
++    }
++    render_pipeline_free(re);
++    scene->r.cfra = saved_frame;
++    scene->r.subframe = saved_subframe;
++    scene->camera = saved_camera;
++    G.is_rendering = saved_rendering;
++    return;
++  }
++
+   render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_INIT);
+ 
+   /* Ugly global still...

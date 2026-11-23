@@ -1,0 +1,10 @@
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -909,6 +909,7 @@
+   PyObject *mod = PyModule_Create(&ccl::module);
+   PyModule_AddObjectRef(mod, "with_bvh_lookahead", Py_True);
+   PyModule_AddObjectRef(mod, "with_native_frame_post", Py_True);
++  PyModule_AddObjectRef(mod, "with_exact_bvh", Py_True);
+ 
+ #ifdef WITH_OSL
+   /* TODO(sergey): This gives us library we've been linking against.

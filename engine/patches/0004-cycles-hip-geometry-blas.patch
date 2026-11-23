@@ -1,0 +1,45 @@
+diff --git a/intern/cycles/scene/geometry.cpp b/intern/cycles/scene/geometry.cpp
+index 1fe20811..fc508999 100644
+--- a/intern/cycles/scene/geometry.cpp
++++ b/intern/cycles/scene/geometry.cpp
+@@ -31,6 +31,9 @@
+ #include "util/progress.h"
+ #include "util/task.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ CCL_NAMESPACE_BEGIN
+ 
+ /* Geometry */
+@@ -967,8 +970,16 @@ void GeometryManager::device_update(Device *device,
+     return;
+   }
+ 
+-  /* Apply transforms, to prepare for static BVH building. */
+-  if (scene->params.bvh_type == BVH_TYPE_STATIC) {
++  /* A persistent animation worker can keep object-local geometry and its native BVH2
++   * instead of flattening single-user geometry into the top-level tree every frame.
++   * Latch the option: switching space after vertices were transformed would be unsafe. */
++  static const bool prefer_hip_geometry_bvhs = []() {
++    const char *value = std::getenv("CYCLES_FRAMEPIPE_HIP_BLAS");
++    return value && value[0] == '1' && value[1] == '\0';
++  }();
++  const bool keep_geometry_bvhs = prefer_hip_geometry_bvhs && scene->params.background &&
++                                  device->info.type == DEVICE_HIP && bvh_layout == BVH_LAYOUT_BVH2;
++  if (scene->params.bvh_type == BVH_TYPE_STATIC && !keep_geometry_bvhs) {
+     const scoped_callback_timer timer([scene](double time) {
+       if (scene->update_stats) {
+         scene->update_stats->object.times.add_entry(
+@@ -1105,6 +1116,11 @@ void GeometryManager::device_update(Device *device,
+ 
+     TaskPool::Summary summary;
+     bvh_task_pool_.wait_work(&summary);
++    if (keep_geometry_bvhs) {
++      std::fprintf(stderr,
++                   "FRAMEPIPE_HIP_BLAS objects=%zu geometries=%zu scheduled_blas_updates=%zu\n",
++                   scene->objects.size(), scene->geometry.size(), num_bvh);
++    }
+     LOG_DEBUG << "Objects BVH build pool statistics:\n" << summary.full_report();
+   }
+ 

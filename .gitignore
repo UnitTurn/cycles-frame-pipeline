@@ -1,0 +1,14 @@
+/work/
+/backend/
+/dist/
+__pycache__/
+*.py[cod]
+*.blend
+*.blend[0-9]*
+*.pdb
+*.exe
+*.dll
+*.fatbin.zst
+*.exr
+.DS_Store
+Thumbs.db

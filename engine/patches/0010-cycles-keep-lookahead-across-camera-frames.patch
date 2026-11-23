@@ -1,0 +1,86 @@
+--- a/intern/cycles/bvh/exact_frame.cpp
++++ b/intern/cycles/bvh/exact_frame.cpp
+@@ -16,6 +16,7 @@
+ #include <cstdlib>
+ #include <filesystem>
+ #include <future>
++#include <optional>
+ #include <thread>
+ #ifdef _WIN32
+ #  include "util/windows.h"
+@@ -496,7 +497,8 @@
+   const char *reason = "not-ready";
+ };
+ struct BVHExactFrames::State {
+-  unique_ptr<Job> pending, running;
++  unique_ptr<Job> running;
++  std::optional<BVHParams> native_params;
+   unique_ptr<Job> previous;
+   bool keep_after_pack = false;
+   bool reuse_previous = value("CYCLES_FRAMEPIPE_EXACT_REUSE") == "1";
+@@ -719,20 +721,25 @@
+     }
+     return;
+   }
+-  if (!state.pending) {
+-    /* A camera-only target may reach sampling without entering the TLAS
+-     * builder. Release its unconsumed tree and file before frame cleanup. */
+-    if (state.running && state.running->path != value("CYCLES_FRAMEPIPE_NEXT")) {
+-      state.running->stop.store(true);
+-      state.active.wait();
+-      state.active = {};
+-      state.running.reset();
+-      std::fprintf(stderr, "FRAMEPIPE_EXACT discarded=unused-target\n");
+-    }
++  const fs::path next = value("CYCLES_FRAMEPIPE_NEXT");
++  if (state.running && state.running->path == next) {
++    return; /* More samples in the same frame. */
++  }
++  if (state.running) {
++    /* The current frame reused its existing TLAS and skipped exchange(). */
++    state.running->stop.store(true);
++    state.active.wait();
++    state.active = {};
++    state.running.reset();
++    std::fprintf(stderr, "FRAMEPIPE_EXACT discarded=unused-target\n");
++  }
++  if (!state.native_params || next.empty() || value("CYCLES_FRAMEPIPE_LAST") == "1") {
+     return;
+   }
+-  state.running = std::move(state.pending);
+   try {
++    state.running = make_unique<Job>();
++    state.running->path = next;
++    state.running->params = *state.native_params;
+     auto *job = state.running.get();
+     const int threads = std::max(1, TaskScheduler::max_concurrency());
+     state.active = std::async(std::launch::async, [job, threads] {
+@@ -871,7 +878,6 @@
+   const BVHParams input_params = builder.params;
+   unique_ptr<BVHNode> result;
+   unique_ptr<Job> ready;
+-  state.pending.reset();
+   if (state.active.valid()) {
+     diagnose_objects(state.running->path, ".actual.tsv", builder.objects, builder.references);
+     state.running->at_boundary.store(true);
+@@ -1026,14 +1032,12 @@
+     std::fprintf(stderr, "FRAMEPIPE_EXACT miss=%s refs=%zu\n", outcome, builder.references.size());
+   }
+   ready.reset();
+-  const fs::path next = value("CYCLES_FRAMEPIPE_NEXT");
+-  if (!next.empty() && value("CYCLES_FRAMEPIPE_LAST") != "1" &&
+-      !builder.params.use_unaligned_nodes && builder.params.bvh_layout == BVH_LAYOUT_BVH2)
+-  {
+-    auto pending = make_unique<Job>();
+-    pending->path = next;
+-    pending->params = input_params;
+-    state.pending = std::move(pending);
++  if (!input_params.use_unaligned_nodes && input_params.bvh_layout == BVH_LAYOUT_BVH2) {
++    /* Persist across camera-only frames, where Cycles never enters this builder. */
++    state.native_params = input_params;
++  }
++  else {
++    state.native_params.reset();
+   }
+   return result;
+ }

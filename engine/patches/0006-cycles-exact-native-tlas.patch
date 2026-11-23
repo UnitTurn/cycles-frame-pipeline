@@ -1,0 +1,1338 @@
+diff --git a/intern/cycles/bvh/CMakeLists.txt b/intern/cycles/bvh/CMakeLists.txt
+index f0d411c3..890eafb4 100644
+--- a/intern/cycles/bvh/CMakeLists.txt
++++ b/intern/cycles/bvh/CMakeLists.txt
+@@ -16,6 +16,7 @@ set(SRC
+   binning.cpp
+   build.cpp
+   frame_lookahead.cpp
++  exact_frame.cpp
+   embree.cpp
+   hiprt.cpp
+   multi.cpp
+diff --git a/intern/cycles/bvh/binning.h b/intern/cycles/bvh/binning.h
+index 4f42cdfd..2caaee2f 100644
+--- a/intern/cycles/bvh/binning.h
++++ b/intern/cycles/bvh/binning.h
+@@ -41,6 +41,8 @@ class BVHObjectBinning : public BVHRange {
+ 
+   float splitSAH; /* SAH cost of the best split */
+   float leafSAH;  /* SAH cost of creating a leaf */
++  /* Binary path to a fixed-depth cache partition when strict reuse is enabled. */
++  int frame_partition = 0;
+ 
+  protected:
+   int dim;         /* best split dimension */
+diff --git a/intern/cycles/bvh/build.cpp b/intern/cycles/bvh/build.cpp
+index ad613b33..1baaeb84 100644
+--- a/intern/cycles/bvh/build.cpp
++++ b/intern/cycles/bvh/build.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "bvh/binning.h"
+ #include "bvh/frame_lookahead.h"
++#include "bvh/exact_frame.h"
+ #include "bvh/node.h"
+ #include "bvh/params.h"
+ #include "bvh/split.h"
+@@ -473,10 +474,16 @@ unique_ptr<BVHNode> BVHBuild::run(BVHFrameLookahead *lookahead)
+     return nullptr;
+   }
+ 
++  if (params.top_level && BVHExactFrames::capture(*this, root)) {
++    return nullptr;
++  }
+   if (lookahead) {
+-    if (unique_ptr<BVHNode> ready = lookahead->exchange(*this)) {
++    if (unique_ptr<BVHNode> ready = lookahead->exchange(*this, root)) {
+       return ready;
+     }
++    if (is_cancelled()) {
++      return nullptr;
++    }
+   }
+   return build_references(root);
+ }
+@@ -709,6 +716,14 @@ bool BVHBuild::range_within_max_leaf_size(const BVHRange &range,
+ 
+ /* multithreaded binning builder */
+ unique_ptr<BVHNode> BVHBuild::build_node(const BVHObjectBinning &range, const int level)
++{
++  if (exact_partitions && level == BVHExactPartitions::depth) {
++    return exact_partitions->build(*this, range, level);
++  }
++  return build_node_native(range, level);
++}
++
++unique_ptr<BVHNode> BVHBuild::build_node_native(const BVHObjectBinning &range, const int level)
+ {
+   const size_t size = range.size();
+   const float leafSAH = params.sah_primitive_cost * range.leafSAH;
+@@ -761,6 +776,10 @@ unique_ptr<BVHNode> BVHBuild::build_node(const BVHObjectBinning &range, const in
+   else {
+     range.split(references.data(), left, right);
+   }
++  if (exact_partitions && level < BVHExactPartitions::depth) {
++    left.frame_partition = range.frame_partition * 2;
++    right.frame_partition = range.frame_partition * 2 + 1;
++  }
+ 
+   BoundBox bounds;
+   if (do_unalinged_split) {
+diff --git a/intern/cycles/bvh/build.h b/intern/cycles/bvh/build.h
+index b66c51c4..370f9cca 100644
+--- a/intern/cycles/bvh/build.h
++++ b/intern/cycles/bvh/build.h
+@@ -24,6 +24,7 @@ class Boundbox;
+ class BVHBuildTask;
+ class BVHNode;
+ class BVHFrameLookahead;
++class BVHExactPartitions;
+ class BVHSpatialSplitBuildTask;
+ class BVHParams;
+ class InnerNode;
+@@ -52,6 +53,9 @@ class BVHBuild {
+ 
+  protected:
+   friend class BVHFrameLookahead;
++  friend class BVHExactFrames;
++  friend class BVHExactPartitions;
++  BVHExactPartitions *exact_partitions = nullptr;
+   unique_ptr<BVHNode> build_references(const BVHRange &root);
+   uint object_visibility(int index) const;
+   vector<uint> snapshot_visibility;
+@@ -85,6 +89,7 @@ class BVHBuild {
+                                  const int level,
+                                  BVHSpatialStorage *storage);
+   unique_ptr<BVHNode> build_node(const BVHObjectBinning &range, const int level);
++  unique_ptr<BVHNode> build_node_native(const BVHObjectBinning &range, const int level);
+   unique_ptr<BVHNode> create_leaf_node(const BVHRange &range,
+                                        const vector<BVHReference> &references);
+   unique_ptr<BVHNode> create_object_leaf_nodes(const BVHReference *ref,
+diff --git a/intern/cycles/bvh/bvh2.cpp b/intern/cycles/bvh/bvh2.cpp
+index 15ac60c6..8f2c57fb 100644
+--- a/intern/cycles/bvh/bvh2.cpp
++++ b/intern/cycles/bvh/bvh2.cpp
+@@ -15,6 +15,8 @@
+ #include "scene/pointcloud.h"
+ 
+ #include "bvh/build.h"
++#include "bvh/exact_frame.h"
++#include "bvh/frame_lookahead.h"
+ #include "bvh/node.h"
+ #include "bvh/unaligned.h"
+ 
+@@ -56,7 +58,7 @@ void BVH2::build(Progress &progress, Stats * /*unused*/)
+ 
+   /* BVH builder returns tree in a binary mode (with two children per inner
+    * node. Need to adopt that for a wider BVH implementations. */
+-  const unique_ptr<BVHNode> root = widen_children_nodes(std::move(bvh2_root));
++  unique_ptr<BVHNode> root = widen_children_nodes(std::move(bvh2_root));
+ 
+   if (progress.get_cancel()) {
+     return;
+@@ -73,6 +75,12 @@ void BVH2::build(Progress &progress, Stats * /*unused*/)
+   /* pack nodes */
+   progress.set_substatus("Packing BVH nodes");
+   pack_nodes(root.get());
++  if (params.top_level) {
++    BVHExactFrames::audit(pack);
++    if (frame_lookahead) {
++      frame_lookahead->keep_tree(root);
++    }
++  }
+ }
+ 
+ void BVH2::refit(Progress &progress)
+diff --git a/intern/cycles/bvh/exact_frame.cpp b/intern/cycles/bvh/exact_frame.cpp
+new file mode 100644
+index 00000000..7e94cd60
+--- /dev/null
++++ b/intern/cycles/bvh/exact_frame.cpp
+@@ -0,0 +1,1040 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#include "bvh/exact_frame.h"
++#include "bvh/binning.h"
++#include "bvh/build.h"
++#include "bvh/bvh.h"
++#include "bvh/node.h"
++#include "scene/geometry.h"
++#include "scene/object.h"
++#include "util/md5.h"
++#include "util/progress.h"
++#include <array>
++#include <bit>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <future>
++#include <thread>
++#ifdef _WIN32
++#  include "util/windows.h"
++#  include <fcntl.h>
++#  include <io.h>
++#  include <share.h>
++#endif
++
++CCL_NAMESPACE_BEGIN
++namespace {
++namespace fs = std::filesystem;
++using namespace std::chrono_literals;
++using Clock = std::chrono::steady_clock;
++constexpr size_t chunk = 8192;
++/* Packed native nodes and indices are signed ints; this is an addressing
++ * bound, independent of the predictor's one-million-reference budget. */
++constexpr uint64_t native_limit = INT_MAX / 8;
++constexpr char signature[8] = {'C', 'Y', '5', '2', 'X', 'T', 'L', '1'};
++fs::path value(const char *name)
++{
++#ifdef _WIN32
++  const std::wstring key(name, name + std::strlen(name));
++  const DWORD length = GetEnvironmentVariableW(key.c_str(), nullptr, 0);
++  if (!length) {
++    return {};
++  }
++  std::wstring text(length, 0);
++  const DWORD used = GetEnvironmentVariableW(key.c_str(), text.data(), length);
++  if (!used || used >= length) {
++    return {};
++  }
++  text.resize(used);
++  return text;
++#else
++  const char *text = std::getenv(name);
++  return text ? fs::path(text) : fs::path();
++#endif
++}
++
++struct Close {
++  void operator()(FILE *f) const
++  {
++    if (f) {
++      std::fclose(f);
++    }
++  }
++};
++using File = std::unique_ptr<FILE, Close>;
++File open_file(const fs::path &path, bool write)
++{
++#ifdef _WIN32
++  if (write) {
++    return File(_wfsopen(path.c_str(), L"wb", _SH_DENYRW));
++  }
++  /* Keep the exact input immutable throughout validation, while allowing a
++   * completed or cancelled job to unlink its frame staging directory. */
++  HANDLE handle = CreateFileW(path.c_str(),
++                              GENERIC_READ,
++                              FILE_SHARE_READ | FILE_SHARE_DELETE,
++                              nullptr,
++                              OPEN_EXISTING,
++                              FILE_ATTRIBUTE_NORMAL,
++                              nullptr);
++  if (handle == INVALID_HANDLE_VALUE) {
++    return {};
++  }
++  const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle),
++                                 _O_RDONLY | _O_BINARY | _O_NOINHERIT);
++  if (fd < 0) {
++    CloseHandle(handle);
++    return {};
++  }
++  File file(_fdopen(fd, "rb"));
++  if (!file) {
++    _close(fd);
++  }
++  return file;
++#else
++  return File(std::fopen(path.c_str(), write ? "wb" : "rb"));
++#endif
++}
++template<class T> bool put(FILE *f, const T *p, size_t n = 1)
++{
++  return std::fwrite(p, sizeof(T), n, f) == n;
++}
++template<class T> bool get(FILE *f, T *p, size_t n = 1)
++{
++  return std::fread(p, sizeof(T), n, f) == n;
++}
++
++/* No native struct padding or object pointers on disk. Float payloads retain
++ * signed zero and every bit of native bounds/intervals. */
++struct Record {
++  float lo[3];
++  int32_t index;
++  float hi[3];
++  int32_t object;
++  int32_t type;
++  float from, to;
++};
++static_assert(sizeof(Record) == 44);
++struct Header {
++  char magic[8];
++  uint64_t refs, objects;
++  std::array<uint32_t, 21> options;
++  std::array<float, 12> root;
++  uint32_t reserved;
++};
++static_assert(sizeof(Header) == 160);
++
++std::array<uint32_t, 21> options(const BVHParams &params)
++{
++  return {uint32_t(params.use_spatial_split),
++          std::bit_cast<uint32_t>(params.spatial_split_alpha),
++          std::bit_cast<uint32_t>(params.unaligned_split_threshold),
++          std::bit_cast<uint32_t>(params.sah_node_cost),
++          std::bit_cast<uint32_t>(params.sah_primitive_cost),
++          uint32_t(params.min_leaf_size),
++          uint32_t(params.max_triangle_leaf_size),
++          uint32_t(params.max_motion_triangle_leaf_size),
++          uint32_t(params.max_curve_leaf_size),
++          uint32_t(params.max_motion_curve_leaf_size),
++          uint32_t(params.max_point_leaf_size),
++          uint32_t(params.max_motion_point_leaf_size),
++          uint32_t(params.top_level),
++          uint32_t(params.bvh_layout),
++          uint32_t(params.use_unaligned_nodes),
++          uint32_t(params.use_compact_structure),
++          uint32_t(params.num_motion_triangle_steps),
++          uint32_t(params.num_motion_curve_steps),
++          uint32_t(params.num_motion_point_steps),
++          uint32_t(params.bvh_type),
++          uint32_t(params.curve_subdivisions)};
++}
++Header header(const BVHRange &range, const BVHParams &params, size_t refs, size_t objects)
++{
++  const BoundBox &bounds = range.bounds(), &centers = range.cent_bounds();
++  Header header{};
++  std::memcpy(header.magic, signature, sizeof(signature));
++  header.refs = refs;
++  header.objects = objects;
++  header.options = options(params);
++  header.root = {bounds.min.x,
++                 bounds.min.y,
++                 bounds.min.z,
++                 bounds.max.x,
++                 bounds.max.y,
++                 bounds.max.z,
++                 centers.min.x,
++                 centers.min.y,
++                 centers.min.z,
++                 centers.max.x,
++                 centers.max.y,
++                 centers.max.z};
++  return header;
++}
++Record encode(const BVHReference &ref)
++{
++  const BoundBox &bounds = ref.bounds();
++  return {{bounds.min.x, bounds.min.y, bounds.min.z},
++          ref.prim_index(),
++          {bounds.max.x, bounds.max.y, bounds.max.z},
++          ref.prim_object(),
++          ref.prim_type(),
++          ref.time_from(),
++          ref.time_to()};
++}
++bool finite(float v)
++{
++  return (std::bit_cast<uint32_t>(v) & 0x7f800000U) != 0x7f800000U;
++}
++bool valid(const Record &record, size_t num_objects)
++{
++  if (record.object < 0 || size_t(record.object) >= num_objects || record.index < -1 ||
++      record.type < 0 || !finite(record.from) || !finite(record.to) || record.from < 0 ||
++      record.to > 1 || record.from > record.to)
++  {
++    return false;
++  }
++  for (int i = 0; i < 3; ++i) {
++    if (!finite(record.lo[i]) || !finite(record.hi[i]) || record.lo[i] > record.hi[i]) {
++      return false;
++    }
++  }
++  if (record.index == -1) {
++    return record.type == 0;
++  }
++  const int type = (record.type & PRIMITIVE_ALL) & ~PRIMITIVE_MOTION;
++  if (type == PRIMITIVE_CURVE_THICK || type == PRIMITIVE_CURVE_RIBBON ||
++      type == PRIMITIVE_CURVE_THICK_LINEAR)
++  {
++    return true;
++  }
++  return (record.type >> PRIMITIVE_NUM_BITS) == 0 &&
++         (type == PRIMITIVE_TRIANGLE || type == PRIMITIVE_POINT || type == PRIMITIVE_VOLUME);
++}
++BoundBox bounds(const float *lo, const float *hi)
++{
++  return BoundBox(make_float3(lo[0], lo[1], lo[2]), make_float3(hi[0], hi[1], hi[2]));
++}
++
++File temporary_evidence()
++{
++#ifdef _WIN32
++  std::error_code error;
++  /* Private delete-on-close handles must not pin the render job's staging
++   * directory when a frame finishes without any BVH update. */
++  const fs::path directory = fs::temp_directory_path(error);
++  wchar_t filename[MAX_PATH];
++  if (error || !GetTempFileNameW(directory.c_str(), L"bvh", 0, filename)) {
++    return {};
++  }
++  File file(_wfsopen(filename, L"w+bTD", _SH_DENYRW));
++  if (!file) {
++    DeleteFileW(filename);
++  }
++  return file;
++#else
++  return File(std::tmpfile());
++#endif
++}
++
++struct Evidence {
++  File file;
++  Header header{};
++  int start = 0;
++};
++
++/* Full ordered inputs on temporary storage; live memory is one small block
++ * per binner task. Sharing a visibility value between different object
++ * indices never substitutes for checking both the index and the mask. */
++template<typename Encode>
++bool transfer_evidence(FILE *file, const int count, const Encode &input, const bool writing)
++{
++  struct Item {
++    Record record;
++    uint32_t mask;
++  };
++  static_assert(sizeof(Item) == 48);
++  std::array<Item, 512> block;
++  for (int start = 0; start < count; start += block.size()) {
++    const size_t size = std::min<size_t>(block.size(), count - start);
++    if (!writing && !get(file, block.data(), size)) {
++      return false;
++    }
++    for (size_t i = 0; i < size; ++i) {
++      const auto [ref, mask] = input(start + int(i));
++      const Item actual{encode(ref), mask};
++      if (writing) {
++        block[i] = actual;
++      }
++      else if (std::memcmp(&block[i], &actual, sizeof(Item)) != 0) {
++        return false;
++      }
++    }
++    if (writing && !put(file, block.data(), size)) {
++      return false;
++    }
++  }
++  return !writing || std::fflush(file) == 0;
++}
++
++template<typename Encode>
++bool verify_evidence(const Evidence &evidence, const Header &current, const Encode &input)
++{
++  if (!evidence.file || std::memcmp(&evidence.header, &current, sizeof(Header))) {
++    return false;
++  }
++  std::rewind(evidence.file.get());
++  return transfer_evidence(evidence.file.get(), int(current.refs), input, false);
++}
++
++template<typename Encode>
++void save_evidence(Evidence &evidence, const Header &info, const int offset, const Encode &input)
++{
++  evidence.file = temporary_evidence();
++  if (evidence.file && transfer_evidence(evidence.file.get(), int(info.refs), input, true)) {
++    evidence.header = info;
++    evidence.start = offset;
++  }
++  else {
++    evidence.file.reset();
++  }
++}
++
++void shift_leaf_offsets(BVHNode &node, const int delta)
++{
++  if (node.is_leaf()) {
++    LeafNode &leaf = static_cast<LeafNode &>(node);
++    /* Cycles encodes an empty leaf as [0,0] at any position. */
++    if (leaf.lo != leaf.hi) {
++      leaf.lo += delta;
++      leaf.hi += delta;
++    }
++  }
++  else {
++    for (int i = 0; i < node.num_children(); ++i) {
++      shift_leaf_offsets(*node.get_child(i), delta);
++    }
++  }
++}
++/* Opt-in comparison of a real discrepancy. The object table is small even
++ * for a flattened TLAS. No hashing or per-reference storage is needed. */
++void diagnose_objects(const fs::path &snapshot,
++                      const char *suffix,
++                      const vector<Object *> &objects,
++                      const vector<BVHReference> &references)
++{
++  const fs::path directory = value("CYCLES_FRAMEPIPE_DIAG_OBJECTS");
++  if (directory.empty() || snapshot.empty()) {
++    return;
++  }
++  struct Counts {
++    size_t refs = 0, timed = 0;
++    int first = -1, last = -1, first_type = 0;
++  };
++  try {
++    fs::create_directories(directory);
++    fs::path path = directory / snapshot.filename();
++    path += suffix;
++    File output = open_file(path, true);
++    if (!output) {
++      throw std::runtime_error("open");
++    }
++    std::vector<Counts> counts(objects.size());
++    for (const BVHReference &ref : references) {
++      Counts &item = counts[ref.prim_object()];
++      if (!item.refs) {
++        item.first = ref.prim_index();
++        item.first_type = ref.prim_type();
++      }
++      item.refs++;
++      item.last = ref.prim_index();
++      item.timed += ref.time_from() != 0.0f || ref.time_to() != 1.0f;
++    }
++    auto label = [](const ustring &name) {
++      std::string text = name.string();
++      for (char &c : text) {
++        if (c == '\t' || c == '\n' || c == '\r') {
++          c = ' ';
++        }
++      }
++      return text;
++    };
++    std::fputs(
++        "index\tobject\tgeometry\tgeometry_type\tinstanced\ttraceable\tvisibility\trefs\t"
++        "timed_refs\tfirst_prim\tlast_prim\tfirst_type\n",
++        output.get());
++    for (size_t i = 0; i < objects.size(); ++i) {
++      const Object *object = objects[i];
++      const Geometry *geometry = object->get_geometry();
++      const Counts &item = counts[i];
++      std::fprintf(output.get(),
++                   "%zu\t%s\t%s\t%d\t%d\t%d\t%u\t%zu\t%zu\t%d\t%d\t%d\n",
++                   i,
++                   label(object->name).c_str(),
++                   geometry ? label(geometry->name).c_str() : "",
++                   geometry ? int(geometry->geometry_type) : -1,
++                   geometry && geometry->is_instanced(),
++                   object->is_traceable(),
++                   object->visibility_for_tracing(),
++                   item.refs,
++                   item.timed,
++                   item.first,
++                   item.last,
++                   item.first_type);
++    }
++  }
++  catch (const std::exception &e) {
++    std::fprintf(stderr, "FRAMEPIPE_EXACT object-diagnostic-error=%s\n", e.what());
++  }
++}
++}  // namespace
++
++struct BVHExactPartitions::State {
++  struct Branch {
++    Evidence input;
++    BVHNode *built = nullptr;
++    unique_ptr<BVHNode> tree;
++  };
++  std::array<Branch, 1 << depth> branches;
++  State *previous = nullptr;
++  const array<int> *types = nullptr, *indices = nullptr, *objects = nullptr;
++  const array<float2> *times = nullptr;
++  std::atomic<size_t> reused_refs{0}, reused_branches{0};
++  std::atomic<size_t> candidate_trees{0}, matching_headers{0};
++  bool record = true;
++
++  void detach(unique_ptr<BVHNode> &node, const int level = 0, const int slot = 0)
++  {
++    if (!node) {
++      return;
++    }
++    if (level == depth) {
++      if (node.get() == branches[slot].built && branches[slot].input.file) {
++        branches[slot].tree = std::move(node);
++      }
++      return;
++    }
++    if (!node->is_leaf()) {
++      auto &inner = static_cast<InnerNode &>(*node);
++      detach(inner.children[0], level + 1, slot * 2);
++      detach(inner.children[1], level + 1, slot * 2 + 1);
++    }
++  }
++};
++
++BVHExactPartitions::BVHExactPartitions() : state_(make_unique<State>()) {}
++BVHExactPartitions::~BVHExactPartitions() = default;
++
++unique_ptr<BVHNode> BVHExactPartitions::build(BVHBuild &builder,
++                                              const BVHObjectBinning &range,
++                                              const int level)
++{
++  State &state = *state_;
++  State::Branch &current = state.branches[range.frame_partition];
++  const Header info = header(range, builder.params, range.size(), 0);
++  auto input = [&](const int i) {
++    const BVHReference &ref = builder.references[range.start() + i];
++    return std::pair<const BVHReference &, uint32_t>(ref,
++                                                     builder.object_visibility(ref.prim_object()));
++  };
++  if (state.previous) {
++    State::Branch &old = state.previous->branches[range.frame_partition];
++    if (old.tree) {
++      state.candidate_trees.fetch_add(1, std::memory_order_relaxed);
++      if (!std::memcmp(&old.input.header, &info, sizeof(info))) {
++        state.matching_headers.fetch_add(1, std::memory_order_relaxed);
++      }
++    }
++    if (old.tree && verify_evidence(old.input, info, input)) {
++      const int old_start = old.input.start;
++      auto copy = [&](auto &dest, const auto &source) {
++        std::copy_n(source.data() + old_start, range.size(), dest.data() + range.start());
++      };
++      copy(builder.prim_type, *state.types);
++      copy(builder.prim_index, *state.indices);
++      copy(builder.prim_object, *state.objects);
++      if (builder.need_prim_time) {
++        copy(builder.prim_time, *state.times);
++      }
++      if (old_start != range.start()) {
++        shift_leaf_offsets(*old.tree, range.start() - old_start);
++      }
++      if (state.record) {
++        current.input = std::move(old.input);
++        current.input.start = range.start();
++        current.built = old.tree.get();
++      }
++      state.reused_refs.fetch_add(range.size(), std::memory_order_relaxed);
++      state.reused_branches.fetch_add(1, std::memory_order_relaxed);
++      return std::move(old.tree);
++    }
++    /* Release the rejected branch before allocating its replacement. */
++    old.tree.reset();
++    old.input.file.reset();
++  }
++  if (state.record) {
++    save_evidence(current.input, info, range.start(), input);
++  }
++  unique_ptr<BVHNode> node = builder.build_node_native(range, level);
++  current.built = node.get();
++  return node;
++}
++
++struct BVHExactFrames::Job {
++  BVHExactPartitions partitions;
++  Evidence original;
++  fs::path path;
++  BVHParams params;
++  std::atomic<bool> stop{false}, at_boundary{false};
++  Progress progress;
++  File file;
++  Header header{};
++  array<int> type, index, object;
++  array<float2> time;
++  unique_ptr<BVHNode> root;
++  const char *reason = "not-ready";
++};
++struct BVHExactFrames::State {
++  unique_ptr<Job> pending, running;
++  unique_ptr<Job> previous;
++  bool keep_after_pack = false;
++  bool reuse_previous = value("CYCLES_FRAMEPIPE_EXACT_REUSE") == "1";
++  std::future<void> active;
++};
++BVHExactFrames::BVHExactFrames() : state_(make_unique<State>()) {}
++BVHExactFrames::~BVHExactFrames()
++{
++  if (state_->active.valid()) {
++    state_->running->stop.store(true);
++    state_->active.wait();
++  }
++}
++bool BVHExactFrames::producing()
++{
++  return !value("CYCLES_FRAMEPIPE_PRODUCE").empty();
++}
++
++/* Explicit QA only. Covers the merged device-facing TLAS and BLAS payload,
++ * including ordering, ray visibility, shutter intervals and instance offsets. */
++void BVHExactFrames::audit(const PackedBVH &pack)
++{
++  if (value("CYCLES_FRAMEPIPE_AUDIT_PACKED") != "1") {
++    return;
++  }
++  MD5Hash hash;
++  auto append = [&hash](const auto &arr) {
++    uint64_t size = arr.size() * sizeof(*arr.data());
++    hash.append(reinterpret_cast<const uint8_t *>(&size), sizeof(size));
++    const auto *p = reinterpret_cast<const uint8_t *>(arr.data());
++    while (size) {
++      const int n = int(std::min<uint64_t>(size, 1u << 23));
++      hash.append(p, n);
++      p += n;
++      size -= n;
++    }
++  };
++  hash.append(reinterpret_cast<const uint8_t *>(&pack.root_index), sizeof(pack.root_index));
++  append(pack.nodes);
++  append(pack.leaf_nodes);
++  append(pack.object_node);
++  append(pack.prim_type);
++  append(pack.prim_visibility);
++  append(pack.prim_index);
++  append(pack.prim_object);
++  append(pack.prim_time);
++  std::fprintf(stderr, "FRAMEPIPE_EXACT packed=%s\n", hash.get_hex().c_str());
++}
++
++bool BVHExactFrames::capture(BVHBuild &builder, const BVHRange &range)
++{
++  const fs::path destination = value("CYCLES_FRAMEPIPE_PRODUCE");
++  if (destination.empty()) {
++    return false;
++  }
++  diagnose_objects(destination, ".producer.tsv", builder.objects, builder.references);
++  const auto started = Clock::now();
++  std::error_code error;
++  fs::path temporary;
++  try {
++    if (builder.params.use_unaligned_nodes || builder.references.empty() ||
++        builder.references.size() > native_limit)
++    {
++      throw std::runtime_error("unsupported aligned TLAS or empty/overflowing inputs");
++    }
++    if (fs::exists(destination)) {
++      throw std::runtime_error("destination already exists");
++    }
++    temporary = destination;
++    temporary += ".partial." + std::to_string(started.time_since_epoch().count());
++    auto output = open_file(temporary, true);
++    if (!output) {
++      throw std::runtime_error("cannot open snapshot output");
++    }
++    const Header header_data = header(
++        range, builder.params, builder.references.size(), builder.objects.size());
++    if (!put(output.get(), &header_data)) {
++      throw std::runtime_error("snapshot header write");
++    }
++    /* One visibility per Cycles object index, not one entry per primitive. */
++    std::vector<uint32_t> visibility(builder.objects.size());
++    for (size_t i = 0; i < visibility.size(); ++i) {
++      visibility[i] = builder.object_visibility(int(i));
++    }
++    if (!put(output.get(), visibility.data(), visibility.size())) {
++      throw std::runtime_error("visibility write");
++    }
++    std::vector<Record> block(chunk);
++    for (size_t i = 0; i < header_data.refs; i += chunk) {
++      const size_t count = std::min<size_t>(chunk, header_data.refs - i);
++      if (builder.is_cancelled()) {
++        throw std::runtime_error("capture cancelled");
++      }
++      for (size_t j = 0; j < count; ++j) {
++        block[j] = encode(builder.references[i + j]);
++      }
++      if (!put(output.get(), block.data(), count)) {
++        throw std::runtime_error("primitive write");
++      }
++    }
++    FILE *file = output.release();
++    if (std::fclose(file) != 0) {
++      throw std::runtime_error("snapshot flush");
++    }
++    fs::rename(temporary, destination);
++    std::fprintf(stderr,
++                 "FRAMEPIPE_EXACT captured refs=%llu bytes=%llu ms=%.2f\n",
++                 (unsigned long long)header_data.refs,
++                 (unsigned long long)(sizeof(header_data) + 4 * header_data.objects +
++                                      sizeof(Record) * header_data.refs),
++                 std::chrono::duration<double, std::milli>(Clock::now() - started).count());
++    builder.progress.set_cancel("FRAMEPIPE_CAPTURE_COMPLETE");
++  }
++  catch (const std::exception &e) {
++    if (!temporary.empty()) {
++      fs::remove(temporary, error);
++    }
++    std::fprintf(stderr, "FRAMEPIPE_EXACT capture-error=%s\n", e.what());
++    builder.progress.set_error(std::string("Frame capture failed: ") + e.what());
++  }
++  return true;
++}
++
++void BVHExactFrames::prepare(Job &job)
++{
++  /* Atomic publication by the source; allow it to finish during frame N. */
++  while (!(job.file = open_file(job.path, false))) {
++    if (job.stop.load() || job.at_boundary.load()) {
++      job.reason = "snapshot-not-ready";
++      return;
++    }
++    std::this_thread::sleep_for(30ms);
++  }
++  const auto started = Clock::now();
++  job.reason = "snapshot-format";
++  if (!get(job.file.get(), &job.header) || std::memcmp(job.header.magic, signature, 8) ||
++      job.header.reserved || !job.header.refs || job.header.refs > native_limit ||
++      !job.header.objects || job.header.objects > native_limit ||
++      job.header.options != options(job.params))
++  {
++    return;
++  }
++  const uint64_t size = sizeof(Header) + 4 * job.header.objects + sizeof(Record) * job.header.refs;
++  std::error_code error;
++  if (fs::file_size(job.path, error) != size || error) {
++    return;
++  }
++  const vector<Object *> no_objects;
++  BVHBuild builder(
++      no_objects, job.type, job.index, job.object, job.time, job.params, job.progress);
++  builder.detached_stop = &job.stop;
++  builder.snapshot_visibility.resize(job.header.objects);
++  if (!get(job.file.get(), builder.snapshot_visibility.data(), job.header.objects)) {
++    return;
++  }
++  std::vector<Record> block(chunk);
++  builder.references.reserve(job.header.refs);
++  BoundBox actual_bounds = BoundBox::empty, actual_centers = BoundBox::empty;
++  for (size_t i = 0; i < job.header.refs; i += chunk) {
++    if (job.stop.load()) {
++      job.reason = "cancelled";
++      return;
++    }
++    const size_t count = std::min<size_t>(chunk, job.header.refs - i);
++    if (!get(job.file.get(), block.data(), count)) {
++      return;
++    }
++    for (size_t k = 0; k < count; ++k) {
++      const Record &record = block[k];
++      if (!valid(record, job.header.objects)) {
++        return;
++      }
++      const BoundBox bb = bounds(record.lo, record.hi);
++      builder.references.emplace_back(
++          bb, record.index, record.object, record.type, record.from, record.to);
++      actual_bounds.grow(bb);
++      actual_centers.grow(bb.center2());
++    }
++  }
++  const auto &record = job.header.root;
++  for (float v : record) {
++    if (!finite(v)) {
++      return;
++    }
++  }
++  for (int i = 0; i < 3; ++i) {
++    if (record[i] > record[3 + i] || record[6 + i] > record[9 + i] ||
++        record[i] > actual_bounds.min[i] || record[3 + i] < actual_bounds.max[i] ||
++        record[6 + i] > actual_centers.min[i] || record[9 + i] < actual_centers.max[i])
++    {
++      return;
++    }
++  }
++  const BVHRange root(bounds(record.data(), record.data() + 3),
++                      bounds(record.data() + 6, record.data() + 9),
++                      0,
++                      int(job.header.refs));
++  const auto build_started = Clock::now();
++  builder.exact_partitions = &job.partitions;
++  job.root = builder.build_references(root);
++  if (!job.root) {
++    job.reason = "build-cancelled";
++    return;
++  }
++  job.reason = "ready";
++  std::fprintf(stderr,
++               "FRAMEPIPE_EXACT prepared refs=%llu read_ms=%.2f build_ms=%.2f\n",
++               (unsigned long long)job.header.refs,
++               std::chrono::duration<double, std::milli>(build_started - started).count(),
++               std::chrono::duration<double, std::milli>(Clock::now() - build_started).count());
++}
++
++void BVHExactFrames::start()
++{
++  State &state = *state_;
++  if (state.reuse_previous) {
++    if (state.previous && value("CYCLES_FRAMEPIPE_LAST") == "1") {
++      state.previous.reset();
++      state.keep_after_pack = false;
++    }
++    return;
++  }
++  if (!state.pending) {
++    /* A camera-only target may reach sampling without entering the TLAS
++     * builder. Release its unconsumed tree and file before frame cleanup. */
++    if (state.running && state.running->path != value("CYCLES_FRAMEPIPE_NEXT")) {
++      state.running->stop.store(true);
++      state.active.wait();
++      state.active = {};
++      state.running.reset();
++      std::fprintf(stderr, "FRAMEPIPE_EXACT discarded=unused-target\n");
++    }
++    return;
++  }
++  state.running = std::move(state.pending);
++  try {
++    auto *job = state.running.get();
++    const int threads = std::max(1, TaskScheduler::max_concurrency());
++    state.active = std::async(std::launch::async, [job, threads] {
++      tbb::task_arena arena(threads, 1, tbb::task_arena::priority::low);
++      arena.execute([job] { prepare(*job); });
++    });
++    std::fprintf(stderr, "FRAMEPIPE_EXACT launched source=next-frame\n");
++  }
++  catch (const std::exception &e) {
++    state.running.reset();
++    std::fprintf(stderr, "FRAMEPIPE_EXACT miss=launch (%s)\n", e.what());
++  }
++}
++
++void BVHExactFrames::keep_tree(unique_ptr<BVHNode> &root)
++{
++  if (state_->keep_after_pack) {
++    state_->previous->root = std::move(root);
++    state_->keep_after_pack = false;
++  }
++}
++
++void BVHExactFrames::use_partitions(BVHBuild &builder, Job &current, Job *previous)
++{
++  builder.exact_partitions = &current.partitions;
++  if (!previous || !previous->root) {
++    return;
++  }
++  auto &state = *current.partitions.state_;
++  state.previous = previous->partitions.state_.get();
++  state.previous->detach(previous->root);
++  previous->root.reset();
++  size_t saved = 0, attached = 0;
++  for (const auto &branch : state.previous->branches) {
++    saved += bool(branch.input.file);
++    attached += bool(branch.tree);
++  }
++  std::fprintf(stderr, "FRAMEPIPE_EXACT partitions saved=%zu attached=%zu\n", saved, attached);
++  state.types = &previous->type;
++  state.indices = &previous->index;
++  state.objects = &previous->object;
++  state.times = &previous->time;
++}
++
++unique_ptr<BVHNode> BVHExactFrames::reuse_previous(BVHBuild &builder, const BVHRange &range)
++{
++  State &state = *state_;
++  state.keep_after_pack = false;
++  auto previous = std::move(state.previous);
++  if (builder.params.use_unaligned_nodes || builder.params.bvh_layout != BVH_LAYOUT_BVH2) {
++    return nullptr;
++  }
++  auto current = make_unique<Job>();
++  const bool keep = value("CYCLES_FRAMEPIPE_LAST") != "1";
++  const Header info = header(range, builder.params, builder.references.size(), 0);
++  auto input = [&](const int i) {
++    const BVHReference &ref = builder.references[i];
++    return std::pair<const BVHReference &, uint32_t>(ref,
++                                                     builder.object_visibility(ref.prim_object()));
++  };
++  if (previous && previous->root && verify_evidence(previous->original, info, input)) {
++    /* The original unsorted inputs, root and all masks match exactly. */
++    unique_ptr<BVHNode> root = std::move(previous->root);
++    if (keep) {
++      try {
++        builder.prim_type = previous->type;
++        builder.prim_index = previous->index;
++        builder.prim_object = previous->object;
++        builder.prim_time = previous->time;
++        state.previous = std::move(previous);
++        state.keep_after_pack = true;
++      }
++      catch (const std::bad_alloc &) {
++        std::fprintf(stderr, "FRAMEPIPE_EXACT discarded=cache-allocation\n");
++      }
++    }
++    if (previous) {
++      builder.prim_type.steal_data(previous->type);
++      builder.prim_index.steal_data(previous->index);
++      builder.prim_object.steal_data(previous->object);
++      builder.prim_time.steal_data(previous->time);
++    }
++    std::fprintf(
++        stderr, "FRAMEPIPE_EXACT hit=previous-native refs=%zu\n", builder.references.size());
++    return root;
++  }
++  if (keep) {
++    save_evidence(current->original, info, 0, input);
++  }
++  current->partitions.state_->record = keep;
++  use_partitions(builder, *current, previous.get());
++  unique_ptr<BVHNode> result = builder.build_references(range);
++  builder.exact_partitions = nullptr;
++  auto &partition = *current->partitions.state_;
++  if (partition.reused_refs) {
++    std::fprintf(stderr,
++                 "FRAMEPIPE_EXACT hit=partial source=previous refs=%zu total=%zu branches=%zu\n",
++                 partition.reused_refs.load(),
++                 builder.references.size(),
++                 partition.reused_branches.load());
++  }
++  else {
++    std::fprintf(stderr,
++                 "FRAMEPIPE_EXACT miss=%s refs=%zu candidates=%zu matching_headers=%zu\n",
++                 previous ? "changed-native" : "cold",
++                 builder.references.size(),
++                 partition.candidate_trees.load(),
++                 partition.matching_headers.load());
++  }
++  partition.previous = nullptr;
++  previous.reset();
++  if (keep && result) {
++    /* Keep raw builder outputs before pack_primitives/pack_instances change
++     * indices to their device-facing representation. Cache allocation is optional. */
++    try {
++      current->type = builder.prim_type;
++      current->index = builder.prim_index;
++      current->object = builder.prim_object;
++      current->time = builder.prim_time;
++      state.previous = std::move(current);
++      state.keep_after_pack = true;
++    }
++    catch (const std::bad_alloc &) {
++      std::fprintf(stderr, "FRAMEPIPE_EXACT discarded=cache-allocation\n");
++    }
++  }
++  return result;
++}
++
++unique_ptr<BVHNode> BVHExactFrames::exchange(BVHBuild &builder, const BVHRange &range)
++{
++  State &state = *state_;
++  if (state.reuse_previous) {
++    return reuse_previous(builder, range);
++  }
++  const BVHParams input_params = builder.params;
++  unique_ptr<BVHNode> result;
++  unique_ptr<Job> ready;
++  state.pending.reset();
++  if (state.active.valid()) {
++    diagnose_objects(state.running->path, ".actual.tsv", builder.objects, builder.references);
++    state.running->at_boundary.store(true);
++    /* Once building, finish the useful job instead of allocating another
++     * full native tree in the foreground. Waiting for unpublished input ends
++     * immediately at this boundary. Cancellation propagates into the builder. */
++    const auto waited = Clock::now();
++    while (state.active.wait_for(20ms) != std::future_status::ready) {
++      if (builder.is_cancelled()) {
++        state.running->stop.store(true);
++      }
++    }
++    try {
++      state.active.get();
++      ready = std::move(state.running);
++    }
++    catch (const std::bad_alloc &) {
++      std::fprintf(stderr, "FRAMEPIPE_EXACT miss=native-allocation\n");
++      state.running.reset();
++    }
++    catch (const std::exception &e) {
++      std::fprintf(stderr, "FRAMEPIPE_EXACT miss=worker (%s)\n", e.what());
++      state.running.reset();
++    }
++    std::fprintf(stderr,
++                 "FRAMEPIPE_EXACT boundary_wait_ms=%.2f\n",
++                 std::chrono::duration<double, std::milli>(Clock::now() - waited).count());
++  }
++  if (builder.is_cancelled()) {
++    return nullptr;
++  }
++  const char *outcome = ready ? ready->reason : "cold";
++  if (ready && ready->root) {
++    const auto verify_started = Clock::now();
++    const Header input_header = header(
++        range, builder.params, builder.references.size(), builder.objects.size());
++    bool match = !std::memcmp(&input_header, &ready->header, sizeof(input_header));
++    if (!match) {
++      std::fprintf(
++          stderr,
++          "FRAMEPIPE_EXACT mismatch=header refs=%llu/%llu objects=%llu/%llu options=%d root=%d\n",
++          (unsigned long long)ready->header.refs,
++          (unsigned long long)input_header.refs,
++          (unsigned long long)ready->header.objects,
++          (unsigned long long)input_header.objects,
++          input_header.options == ready->header.options,
++          std::memcmp(input_header.root.data(),
++                      ready->header.root.data(),
++                      sizeof(input_header.root)) == 0);
++    }
++    std::rewind(ready->file.get());
++    Header received{};
++    match = match && get(ready->file.get(), &received) &&
++            !std::memcmp(&input_header, &received, sizeof(input_header));
++    std::vector<uint32_t> masks(chunk);
++    for (size_t i = 0; match && i < input_header.objects; i += chunk) {
++      size_t count = std::min<size_t>(chunk, input_header.objects - i);
++      match = get(ready->file.get(), masks.data(), count);
++      for (size_t k = 0; match && k < count; ++k) {
++        match = masks[k] == builder.object_visibility(int(i + k));
++        if (!match) {
++          std::fprintf(stderr, "FRAMEPIPE_EXACT mismatch=visibility index=%zu\n", i + k);
++        }
++      }
++    }
++    std::vector<Record> block(chunk);
++    for (size_t i = 0; match && i < input_header.refs; i += chunk) {
++      size_t count = std::min<size_t>(chunk, input_header.refs - i);
++      match = !builder.is_cancelled() && get(ready->file.get(), block.data(), count);
++      for (size_t k = 0; match && k < count; ++k) {
++        const Record actual = encode(builder.references[i + k]);
++        match = std::memcmp(&actual, &block[k], sizeof(Record)) == 0;
++        if (!match) {
++          std::fprintf(stderr,
++                       "FRAMEPIPE_EXACT mismatch=reference index=%zu object=%d/%d primitive=%d/%d "
++                       "type=%d/%d\n",
++                       i + k,
++                       block[k].object,
++                       actual.object,
++                       block[k].index,
++                       actual.index,
++                       block[k].type,
++                       actual.type);
++          for (int axis = 0; axis < 3; ++axis) {
++            if (std::memcmp(&block[k].lo[axis], &actual.lo[axis], sizeof(float)) ||
++                std::memcmp(&block[k].hi[axis], &actual.hi[axis], sizeof(float)))
++            {
++              std::fprintf(stderr,
++                           "FRAMEPIPE_EXACT mismatch=bounds axis=%d min=%.9g/%.9g max=%.9g/%.9g\n",
++                           axis,
++                           block[k].lo[axis],
++                           actual.lo[axis],
++                           block[k].hi[axis],
++                           actual.hi[axis]);
++              break;
++            }
++          }
++          if (std::bit_cast<uint32_t>(block[k].from) != std::bit_cast<uint32_t>(actual.from) ||
++              std::bit_cast<uint32_t>(block[k].to) != std::bit_cast<uint32_t>(actual.to))
++          {
++            std::fprintf(stderr,
++                         "FRAMEPIPE_EXACT mismatch=shutter from=%.9g/%.9g to=%.9g/%.9g\n",
++                         block[k].from,
++                         actual.from,
++                         block[k].to,
++                         actual.to);
++          }
++        }
++      }
++    }
++    if (match) {
++      builder.prim_type.steal_data(ready->type);
++      builder.prim_index.steal_data(ready->index);
++      builder.prim_object.steal_data(ready->object);
++      builder.prim_time.steal_data(ready->time);
++      result = std::move(ready->root);
++      std::fprintf(
++          stderr,
++          "FRAMEPIPE_EXACT hit=native refs=%llu verify_ms=%.2f\n",
++          (unsigned long long)input_header.refs,
++          std::chrono::duration<double, std::milli>(Clock::now() - verify_started).count());
++    }
++    else {
++      outcome = "input-mismatch";
++      if (input_header.options == ready->header.options && !builder.is_cancelled()) {
++        std::fprintf(
++            stderr, "FRAMEPIPE_EXACT miss=input-mismatch refs=%zu\n", builder.references.size());
++        Job live;
++        live.partitions.state_->record = false;
++        use_partitions(builder, live, ready.get());
++        result = builder.build_references(range);
++        builder.exact_partitions = nullptr;
++        const auto &partition = *live.partitions.state_;
++        if (partition.reused_refs) {
++          std::fprintf(stderr,
++                       "FRAMEPIPE_EXACT hit=partial source=next refs=%zu total=%zu branches=%zu\n",
++                       partition.reused_refs.load(),
++                       builder.references.size(),
++                       partition.reused_branches.load());
++        }
++        else {
++          std::fprintf(
++              stderr,
++              "FRAMEPIPE_EXACT partial-miss source=next candidates=%zu matching_headers=%zu\n",
++              partition.candidate_trees.load(),
++              partition.matching_headers.load());
++        }
++      }
++    }
++  }
++  if (!result) {
++    std::fprintf(stderr, "FRAMEPIPE_EXACT miss=%s refs=%zu\n", outcome, builder.references.size());
++  }
++  ready.reset();
++  const fs::path next = value("CYCLES_FRAMEPIPE_NEXT");
++  if (!next.empty() && value("CYCLES_FRAMEPIPE_LAST") != "1" &&
++      !builder.params.use_unaligned_nodes && builder.params.bvh_layout == BVH_LAYOUT_BVH2)
++  {
++    auto pending = make_unique<Job>();
++    pending->path = next;
++    pending->params = input_params;
++    state.pending = std::move(pending);
++  }
++  return result;
++}
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/bvh/exact_frame.h b/intern/cycles/bvh/exact_frame.h
+new file mode 100644
+index 00000000..3a47652b
+--- /dev/null
++++ b/intern/cycles/bvh/exact_frame.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++#include "util/unique_ptr.h"
++
++CCL_NAMESPACE_BEGIN
++class BVHBuild;
++class BVHNode;
++class BVHRange;
++class BVHObjectBinning;
++struct PackedBVH;
++class BVHExactFrames;
++
++/* Stores disjoint native partitions. The upper levels always execute the
++ * original binner before testing a partition's complete ordered inputs. */
++class BVHExactPartitions {
++ public:
++  static constexpr int depth = 5;
++  BVHExactPartitions();
++  ~BVHExactPartitions();
++  unique_ptr<BVHNode> build(BVHBuild &builder, const BVHObjectBinning &range, int level);
++
++ private:
++  friend class BVHExactFrames;
++  struct State;
++  unique_ptr<State> state_;
++};
++
++/* Independent from prediction/refit. All published nodes use the original
++ * primitive order, shutter intervals, bounds and visibility of the target. */
++class BVHExactFrames {
++ public:
++  BVHExactFrames();
++  ~BVHExactFrames();
++  static bool producing();
++  static void audit(const PackedBVH &pack);
++  static bool capture(BVHBuild &builder, const BVHRange &root);
++  unique_ptr<BVHNode> exchange(BVHBuild &builder, const BVHRange &root);
++  void start();
++  void keep_tree(unique_ptr<BVHNode> &root);
++
++ private:
++  struct Job;
++  struct State;
++  static void prepare(Job &job);
++  static void use_partitions(BVHBuild &builder, Job &current, Job *previous);
++  unique_ptr<BVHNode> reuse_previous(BVHBuild &builder, const BVHRange &range);
++  unique_ptr<State> state_;
++};
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/bvh/frame_lookahead.cpp b/intern/cycles/bvh/frame_lookahead.cpp
+index 6d882f5e..6d37ee33 100644
+--- a/intern/cycles/bvh/frame_lookahead.cpp
++++ b/intern/cycles/bvh/frame_lookahead.cpp
+@@ -3,6 +3,7 @@
+ #include "bvh/frame_lookahead.h"
+ 
+ #include "bvh/build.h"
++#include "bvh/exact_frame.h"
+ #include "bvh/frame_snapshot.h"
+ #include "bvh/node.h"
+ #include "scene/object.h"
+@@ -141,13 +142,19 @@ struct BVHFrameLookahead::Job {
+ };
+ 
+ struct BVHFrameLookahead::State {
++  unique_ptr<BVHExactFrames> exact;
+   size_t generation = 0;
+   unique_ptr<Job> pending;
+   unique_ptr<Job> running;
+   std::future<void> active;
+ };
+ 
+-BVHFrameLookahead::BVHFrameLookahead() : state_(make_unique<State>()) {}
++BVHFrameLookahead::BVHFrameLookahead() : state_(make_unique<State>())
++{
++  if (env_value("CYCLES_FRAMEPIPE_EXACT") == "1") {
++    state_->exact = make_unique<BVHExactFrames>();
++  }
++}
+ BVHFrameLookahead::~BVHFrameLookahead()
+ {
+   if (state_->active.valid()) {
+@@ -249,9 +256,20 @@ void BVHFrameLookahead::prepare(Job &job)
+                ms);
+ }
+ 
++void BVHFrameLookahead::keep_tree(unique_ptr<BVHNode> &root)
++{
++  if (state_->exact) {
++    state_->exact->keep_tree(root);
++  }
++}
++
+ void BVHFrameLookahead::start()
+ {
+   State &s = *state_;
++  if (s.exact) {
++    s.exact->start();
++    return;
++  }
+   if (!s.pending) {
+     return;
+   }
+@@ -283,9 +301,12 @@ void BVHFrameLookahead::start()
+   }
+ }
+ 
+-unique_ptr<BVHNode> BVHFrameLookahead::exchange(BVHBuild &builder)
++unique_ptr<BVHNode> BVHFrameLookahead::exchange(BVHBuild &builder, const BVHRange &root)
+ {
+   State &s = *state_;
++  if (s.exact) {
++    return s.exact->exchange(builder, root);
++  }
+   ++s.generation;
+   s.pending.reset(); /* Another sync before any path tracing. */
+   unique_ptr<Job> ready;
+diff --git a/intern/cycles/bvh/frame_lookahead.h b/intern/cycles/bvh/frame_lookahead.h
+index 00683b7b..89b3e17e 100644
+--- a/intern/cycles/bvh/frame_lookahead.h
++++ b/intern/cycles/bvh/frame_lookahead.h
+@@ -6,6 +6,7 @@
+ CCL_NAMESPACE_BEGIN
+ 
+ class BVHBuild;
++class BVHRange;
+ class BVHNode;
+ 
+ /* One owner per persistent scene. exchange() and start() are called serially by
+@@ -15,8 +16,9 @@ class BVHFrameLookahead {
+   BVHFrameLookahead();
+   ~BVHFrameLookahead();
+   static bool enabled();
+-  unique_ptr<BVHNode> exchange(BVHBuild &builder);
++  unique_ptr<BVHNode> exchange(BVHBuild &builder, const BVHRange &root);
+   void start();
++  void keep_tree(unique_ptr<BVHNode> &root);
+ 
+  private:
+   struct State;

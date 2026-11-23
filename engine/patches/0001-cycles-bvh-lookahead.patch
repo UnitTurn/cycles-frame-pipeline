@@ -1,0 +1,943 @@
+diff --git a/intern/cycles/bvh/CMakeLists.txt b/intern/cycles/bvh/CMakeLists.txt
+index 5b01017b..f0d411c3 100644
+--- a/intern/cycles/bvh/CMakeLists.txt
++++ b/intern/cycles/bvh/CMakeLists.txt
+@@ -15,6 +15,7 @@ set(SRC
+   bvh2.cpp
+   binning.cpp
+   build.cpp
++  frame_lookahead.cpp
+   embree.cpp
+   hiprt.cpp
+   multi.cpp
+diff --git a/intern/cycles/bvh/build.cpp b/intern/cycles/bvh/build.cpp
+index 70cf1dcc..ad613b33 100644
+--- a/intern/cycles/bvh/build.cpp
++++ b/intern/cycles/bvh/build.cpp
+@@ -8,6 +8,7 @@
+ #include "bvh/build.h"
+ 
+ #include "bvh/binning.h"
++#include "bvh/frame_lookahead.h"
+ #include "bvh/node.h"
+ #include "bvh/params.h"
+ #include "bvh/split.h"
+@@ -423,7 +424,7 @@ void BVHBuild::add_references(BVHRange &root)
+ 
+     i++;
+ 
+-    if (progress.get_cancel()) {
++    if (is_cancelled()) {
+       return;
+     }
+   }
+@@ -438,7 +439,18 @@ void BVHBuild::add_references(BVHRange &root)
+ 
+ /* Build */
+ 
+-unique_ptr<BVHNode> BVHBuild::run()
++bool BVHBuild::is_cancelled() const
++{
++  return detached_stop ? detached_stop->load(std::memory_order_relaxed) : progress.get_cancel();
++}
++
++uint BVHBuild::object_visibility(const int index) const
++{
++  return snapshot_visibility.empty() ? objects[index]->visibility_for_tracing() :
++                                       snapshot_visibility[index];
++}
++
++unique_ptr<BVHNode> BVHBuild::run(BVHFrameLookahead *lookahead)
+ {
+   BVHRange root;
+ 
+@@ -457,10 +469,20 @@ unique_ptr<BVHNode> BVHBuild::run()
+   /* add references */
+   add_references(root);
+ 
+-  if (progress.get_cancel()) {
++  if (is_cancelled()) {
+     return nullptr;
+   }
+ 
++  if (lookahead) {
++    if (unique_ptr<BVHNode> ready = lookahead->exchange(*this)) {
++      return ready;
++    }
++  }
++  return build_references(root);
++}
++
++unique_ptr<BVHNode> BVHBuild::build_references(const BVHRange &root)
++{
+   /* init spatial splits */
+   if (params.top_level) {
+     /* NOTE: Technically it is supported by the builder but it's not really
+@@ -531,7 +553,7 @@ unique_ptr<BVHNode> BVHBuild::run()
+ 
+   /* delete if we canceled */
+   if (rootnode) {
+-    if (progress.get_cancel()) {
++    if (is_cancelled()) {
+       rootnode.reset();
+       LOG_DEBUG << "BVH build canceled.";
+     }
+@@ -589,7 +611,7 @@ void BVHBuild::thread_build_node(InnerNode *inner,
+                                  const BVHObjectBinning &range,
+                                  const int level)
+ {
+-  if (progress.get_cancel()) {
++  if (is_cancelled()) {
+     return;
+   }
+ 
+@@ -616,7 +638,7 @@ void BVHBuild::thread_build_spatial_split_node(InnerNode *inner,
+                                                vector<BVHReference> &references,
+                                                const int level)
+ {
+-  if (progress.get_cancel()) {
++  if (is_cancelled()) {
+     return;
+   }
+ 
+@@ -788,7 +810,7 @@ unique_ptr<BVHNode> BVHBuild::build_node(const BVHRange &range,
+    * on checking cancel status.
+    */
+   progress_update();
+-  if (progress.get_cancel()) {
++  if (is_cancelled()) {
+     return nullptr;
+   }
+ 
+@@ -917,7 +939,7 @@ unique_ptr<BVHNode> BVHBuild::create_object_leaf_nodes(const BVHReference *ref,
+       prim_time[start] = make_float2(ref->time_from(), ref->time_to());
+     }
+ 
+-    const uint visibility = objects[ref->prim_object()]->visibility_for_tracing();
++    const uint visibility = object_visibility(ref->prim_object());
+     unique_ptr<BVHNode> leaf_node = make_unique<LeafNode>(
+         ref->bounds(), visibility, start, start + 1);
+     leaf_node->time_from = ref->time_from();
+@@ -993,7 +1015,7 @@ unique_ptr<BVHNode> BVHBuild::create_leaf_node(const BVHRange &range,
+       p_time[type_index].push_back(make_float2(ref.time_from(), ref.time_to()));
+ 
+       bounds[type_index].grow(ref.bounds());
+-      visibility[type_index] |= objects[ref.prim_object()]->visibility_for_tracing();
++      visibility[type_index] |= object_visibility(ref.prim_object());
+       ++num_new_prims;
+     }
+     else {
+diff --git a/intern/cycles/bvh/build.h b/intern/cycles/bvh/build.h
+index 9bf9a82c..b66c51c4 100644
+--- a/intern/cycles/bvh/build.h
++++ b/intern/cycles/bvh/build.h
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cfloat>
+ 
+ #include "bvh/params.h"
+@@ -22,6 +23,7 @@ CCL_NAMESPACE_BEGIN
+ class Boundbox;
+ class BVHBuildTask;
+ class BVHNode;
++class BVHFrameLookahead;
+ class BVHSpatialSplitBuildTask;
+ class BVHParams;
+ class InnerNode;
+@@ -46,9 +48,16 @@ class BVHBuild {
+            Progress &progress);
+   ~BVHBuild();
+ 
+-  unique_ptr<BVHNode> run();
++  unique_ptr<BVHNode> run(BVHFrameLookahead *lookahead = nullptr);
+ 
+  protected:
++  friend class BVHFrameLookahead;
++  unique_ptr<BVHNode> build_references(const BVHRange &root);
++  uint object_visibility(int index) const;
++  vector<uint> snapshot_visibility;
++  const std::atomic<bool> *detached_stop = nullptr;
++  bool is_cancelled() const;
++
+   friend class BVHMixedSplit;
+   friend class BVHObjectSplit;
+   friend class BVHSpatialSplit;
+diff --git a/intern/cycles/bvh/bvh2.cpp b/intern/cycles/bvh/bvh2.cpp
+index 24df34f6..15ac60c6 100644
+--- a/intern/cycles/bvh/bvh2.cpp
++++ b/intern/cycles/bvh/bvh2.cpp
+@@ -48,7 +48,7 @@ void BVH2::build(Progress &progress, Stats * /*unused*/)
+                      pack.prim_time,
+                      params,
+                      progress);
+-  unique_ptr<BVHNode> bvh2_root = bvh_build.run();
++  unique_ptr<BVHNode> bvh2_root = bvh_build.run(frame_lookahead);
+ 
+   if (progress.get_cancel()) {
+     return;
+diff --git a/intern/cycles/bvh/bvh2.h b/intern/cycles/bvh/bvh2.h
+index 1b03a5b2..f876cf73 100644
+--- a/intern/cycles/bvh/bvh2.h
++++ b/intern/cycles/bvh/bvh2.h
+@@ -35,6 +35,8 @@ struct BVHStackEntry {
+  *
+  * Typical BVH with each node having two children.
+  */
++class BVHFrameLookahead;
++
+ class BVH2 : public BVH {
+  public:
+   BVH2(const BVHParams &params,
+@@ -45,6 +47,7 @@ class BVH2 : public BVH {
+   void refit(Progress &progress);
+ 
+   PackedBVH pack;
++  BVHFrameLookahead *frame_lookahead = nullptr;  /* Owned by Scene. */
+ 
+  protected:
+   /* Building process. */
+diff --git a/intern/cycles/bvh/frame_lookahead.cpp b/intern/cycles/bvh/frame_lookahead.cpp
+new file mode 100644
+index 00000000..6d882f5e
+--- /dev/null
++++ b/intern/cycles/bvh/frame_lookahead.cpp
+@@ -0,0 +1,445 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#include "bvh/frame_lookahead.h"
++
++#include "bvh/build.h"
++#include "bvh/frame_snapshot.h"
++#include "bvh/node.h"
++#include "scene/object.h"
++#include "util/progress.h"
++
++#include <charconv>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <future>
++#include <numeric>
++#include <tuple>
++#ifdef _WIN32
++#  include "util/windows.h"
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++namespace {
++using Ref = framepipe::SnapshotRef;
++using Refs = std::vector<Ref>;
++namespace fs = std::filesystem;
++
++fs::path env_value(const char *name)
++{
++#ifdef _WIN32
++  const std::wstring key(name, name + std::strlen(name));
++  const DWORD count = GetEnvironmentVariableW(key.c_str(), nullptr, 0);
++  if (count == 0) {
++    return {};
++  }
++  std::wstring value(count, L'\0');
++  const DWORD used = GetEnvironmentVariableW(key.c_str(), value.data(), count);
++  if (!used || used >= count) {
++    return {};
++  }
++  value.resize(used);
++  return value;
++#else
++  const char *value = std::getenv(name);
++  return value ? fs::path(value) : fs::path();
++#endif
++}
++
++size_t max_refs()
++{
++  const std::string limit = env_value("CYCLES_FRAMEPIPE_MAX_REFS").string();
++  if (limit.empty()) {
++    return 1000000;
++  }
++  size_t value = 0;
++  const auto result = std::from_chars(limit.data(), limit.data() + limit.size(), value);
++  return (result.ec == std::errc() && result.ptr == limit.data() + limit.size()) ?
++             std::min<size_t>(value, INT_MAX / 8) :
++             0;
++}
++
++/* Budget both inputs, native build nodes, primitive outputs and sorting scratch.
++ * A second check at launch accounts for the current frame's scene/device upload. */
++size_t memory_limit(size_t requested, size_t bytes_per_ref = 768)
++{
++#ifdef _WIN32
++  MEMORYSTATUSEX mem = {};
++  mem.dwLength = sizeof(mem);
++  if (!GlobalMemoryStatusEx(&mem)) {
++    return 0;
++  }
++  constexpr uint64_t reserved = 768ULL << 20;
++  const uint64_t free = std::min(mem.ullAvailPhys, mem.ullAvailPageFile);
++  const uint64_t budget = (free > reserved) ? free - reserved : 0;
++  return std::min(requested, size_t(budget / bytes_per_ref));
++#else
++  (void)bytes_per_ref;
++  return requested;
++#endif
++}
++
++BoundBox box(const Ref &ref)
++{
++  return BoundBox(make_float3(ref.lo[0], ref.lo[1], ref.lo[2]),
++                  make_float3(ref.hi[0], ref.hi[1], ref.hi[2]));
++}
++
++auto key(const Ref &ref)
++{
++  return std::make_tuple(ref.prim_object, ref.prim_index, ref.prim_type);
++}
++
++bool supported(const Ref &ref)
++{
++  return framepipe::valid_snapshot_ref(ref) &&
++         ((ref.prim_index == -1 && ref.prim_type == 0) ||
++          (ref.prim_index >= 0 &&
++           (ref.prim_type == PRIMITIVE_TRIANGLE || ref.prim_type == PRIMITIVE_POINT)));
++}
++
++/* Refit an already partitioned, aligned binary hierarchy. The native leaf
++ * grouping and primitive order remain intact. Every mask and every bound is
++ * assigned from the current frame, including unchanged siblings. */
++void refit(BVHNode &node, const Refs &actual, const std::vector<int> &input_for_slot)
++{
++  node.bounds = BoundBox::empty;
++  node.visibility = 0;
++  if (node.is_leaf()) {
++    const auto &leaf = static_cast<const LeafNode &>(node);
++    for (int slot = leaf.lo; slot < leaf.hi; ++slot) {
++      const Ref &ref = actual[input_for_slot[slot]];
++      node.bounds.grow(box(ref));
++      node.visibility |= ref.visibility;
++    }
++    return;
++  }
++  for (int i = 0; i < node.num_children(); ++i) {
++    BVHNode &child = *node.get_child(i);
++    refit(child, actual, input_for_slot);
++    node.bounds.grow(child.bounds);
++    node.visibility |= child.visibility;
++  }
++}
++}  // namespace
++
++struct BVHFrameLookahead::Job {
++  Refs source;
++  BVHParams params;
++  Progress progress;
++  std::atomic<bool> stop{false};
++  fs::path next;
++  size_t cap = 0;
++  size_t limit = 0;
++  size_t target = 0;
++  array<int> type, index, object;
++  array<float2> time;
++  unique_ptr<BVHNode> root;
++  std::vector<int> input_for_slot;
++};
++
++struct BVHFrameLookahead::State {
++  size_t generation = 0;
++  unique_ptr<Job> pending;
++  unique_ptr<Job> running;
++  std::future<void> active;
++};
++
++BVHFrameLookahead::BVHFrameLookahead() : state_(make_unique<State>()) {}
++BVHFrameLookahead::~BVHFrameLookahead()
++{
++  if (state_->active.valid()) {
++    state_->running->stop.store(true, std::memory_order_relaxed);
++    state_->active.wait();
++  }
++}
++
++bool BVHFrameLookahead::enabled()
++{
++  return env_value("CYCLES_BVH_LOOKAHEAD") == "1";
++}
++
++void BVHFrameLookahead::prepare(Job &job)
++{
++  /* An optional exact snapshot replaces the predictor from the previous frame.
++   * All input is validated before calling Cycles' native builder. */
++  const auto started = std::chrono::steady_clock::now();
++  bool using_baked = false;
++  if (!job.next.empty()) {
++    Refs baked;
++    if (framepipe::read_snapshot(job.next, job.limit, baked) && !baked.empty()) {
++      job.source.swap(baked);
++      using_baked = true;
++    }
++  }
++  const vector<Object *> no_objects;
++  BVHBuild detached(
++      no_objects, job.type, job.index, job.object, job.time, job.params, job.progress);
++  detached.detached_stop = &job.stop;
++  BoundBox bounds = BoundBox::empty, centers = BoundBox::empty;
++  detached.references.reserve(job.source.size());
++  int maximum_object = -1;
++  for (size_t i = 0; i < job.source.size(); ++i) {
++    const Ref &ref = job.source[i];
++    if (!supported(ref) || size_t(ref.prim_object) > job.limit ||
++        (i && !(key(job.source[i - 1]) < key(ref))) ||
++        (i && job.source[i - 1].prim_object == ref.prim_object &&
++         job.source[i - 1].visibility != ref.visibility))
++    {
++      return;
++    }
++    if ((i % 4096 == 0) && job.stop.load(std::memory_order_relaxed)) {
++      return;
++    }
++    maximum_object = std::max(maximum_object, ref.prim_object);
++    const BoundBox b = box(ref);
++    detached.references.emplace_back(b, ref.prim_index, ref.prim_object, ref.prim_type);
++    bounds.grow(b);
++    centers.grow(b.center2());
++  }
++  if (maximum_object < 0) {
++    return;
++  }
++  detached.snapshot_visibility.resize(size_t(maximum_object) + 1);
++  std::vector<size_t> object_offsets(size_t(maximum_object) + 2);
++  for (const Ref &ref : job.source) {
++    detached.snapshot_visibility[ref.prim_object] = ref.visibility;
++    ++object_offsets[ref.prim_object + 1];
++  }
++  std::partial_sum(object_offsets.begin(), object_offsets.end(), object_offsets.begin());
++  job.root = detached.build_references(BVHRange(bounds, centers, 0, int(job.source.size())));
++  if (!job.root || job.index.size() != job.source.size()) {
++    job.root.reset();
++    return;
++  }
++  /* Assign every native packed slot its original input. Work is done by the
++   * producer so the foreground handoff remains linear even with sparse IDs. */
++  job.input_for_slot.resize(job.source.size());
++  for (size_t s = 0; s < job.index.size(); ++s) {
++    const auto target = std::make_tuple(job.object[s], job.index[s], job.type[s]);
++    const size_t begin = object_offsets[job.object[s]], end = object_offsets[job.object[s] + 1];
++    /* Contiguous triangle/point indices and instances need a single lookup.
++     * Degenerate primitives can leave holes in that object's local numbering. */
++    size_t input = begin + size_t(int64_t(job.index[s]) - job.source[begin].prim_index);
++    if (input >= end || key(job.source[input]) != target) {
++      const auto it = std::lower_bound(job.source.begin() + begin,
++                                       job.source.begin() + end,
++                                       target,
++                                       [](const Ref &ref, const auto &k) { return key(ref) < k; });
++      input = size_t(it - job.source.begin());
++    }
++    if (input == end || key(job.source[input]) != target ||
++        ((s % 4096 == 0) && job.stop.load(std::memory_order_relaxed)))
++    {
++      job.root.reset();
++      return;
++    }
++    job.input_for_slot[s] = int(input);
++  }
++  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                              started)
++                        .count();
++  std::fprintf(stderr,
++               "FRAMEPIPE_BVH prepared target=%zu input=%s refs=%zu build_ms=%.2f\n",
++               job.target,
++               using_baked ? "snapshot" : "prediction",
++               job.source.size(),
++               ms);
++}
++
++void BVHFrameLookahead::start()
++{
++  State &s = *state_;
++  if (!s.pending) {
++    return;
++  }
++  s.pending->limit = memory_limit(s.pending->limit);
++  if (s.pending->source.size() > s.pending->limit) {
++    std::fprintf(stderr,
++                 "FRAMEPIPE_BVH miss=memory stage=dispatch refs=%zu cap=%zu limit=%zu\n",
++                 s.pending->source.size(),
++                 s.pending->cap,
++                 s.pending->limit);
++    s.pending.reset();
++    return;
++  }
++  s.running = std::move(s.pending);
++  const size_t target = s.running->target, count = s.running->source.size();
++  try {
++    Job *job = s.running.get();
++    const int workers = std::max(1, TaskScheduler::max_concurrency() / 2);
++    s.active = std::async(std::launch::async, [job, workers] {
++      /* Keep the host render loop and the prior frame's CPU denoiser runnable. */
++      tbb::task_arena arena(workers, 1, tbb::task_arena::priority::low);
++      arena.execute([job] { prepare(*job); });
++    });
++    std::fprintf(stderr, "FRAMEPIPE_BVH launched target=%zu refs=%zu\n", target, count);
++  }
++  catch (const std::exception &e) {
++    s.running.reset();
++    std::fprintf(stderr, "FRAMEPIPE_BVH miss=launch (%s)\n", e.what());
++  }
++}
++
++unique_ptr<BVHNode> BVHFrameLookahead::exchange(BVHBuild &builder)
++{
++  State &s = *state_;
++  ++s.generation;
++  s.pending.reset(); /* Another sync before any path tracing. */
++  unique_ptr<Job> ready;
++  bool busy = false;
++  const fs::path capture = env_value("CYCLES_FRAMEPIPE_CAPTURE");
++  if (s.active.valid()) {
++    if (s.active.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
++      std::fprintf(stderr, "FRAMEPIPE_BVH miss=busy\n");
++      if (capture.empty()) {
++        return nullptr;
++      }
++      busy = true;
++    }
++    else {
++      try {
++        s.active.get();
++        ready = std::move(s.running);
++      }
++      catch (const std::exception &e) {
++        std::fprintf(stderr, "FRAMEPIPE_BVH miss=worker (%s)\n", e.what());
++        s.running.reset();
++      }
++    }
++  }
++  const size_t cap = max_refs(), limit = memory_limit(cap);
++  const size_t refs = builder.references.size();
++  const size_t exchange_limit = ready ? memory_limit(cap, sizeof(Ref)) : limit;
++  const char *reason = nullptr;
++  if (!builder.params.top_level) {
++    reason = "not-top-level";
++  }
++  else if (builder.params.use_unaligned_nodes) {
++    reason = "unaligned";
++  }
++  else if (refs == 0) {
++    reason = "empty";
++  }
++  else if (refs > cap) {
++    reason = "reference-cap";
++  }
++  else if (refs > exchange_limit) {
++    reason = "memory";
++  }
++  if (reason) {
++    std::fprintf(stderr,
++                 "FRAMEPIPE_BVH miss=%s stage=exchange refs=%zu cap=%zu limit=%zu\n",
++                 reason,
++                 refs,
++                 cap,
++                 exchange_limit);
++    return nullptr;
++  }
++  unique_ptr<BVHNode> result;
++  try {
++    Refs live;
++    live.reserve(builder.references.size());
++    /* An enabled time-step setting requests a prim_time array even when the
++     * TLAS contains only static primitives or instance proxies. Such proxies
++     * carry the full shutter bounds from Object::compute_bounds(); their BLAS
++     * may still contain native motion primitives and sliced time intervals.
++     * Only the actual TLAS references below are candidates for reconstruction. */
++    for (const BVHReference &r : builder.references) {
++      const BoundBox &b = r.bounds();
++      const Ref ref{{b.min.x, b.min.y, b.min.z},
++                    {b.max.x, b.max.y, b.max.z},
++                    r.prim_index(),
++                    r.prim_object(),
++                    r.prim_type(),
++                    builder.object_visibility(r.prim_object())};
++      if (!supported(ref) || r.time_from() != 0.0f || r.time_to() != 1.0f ||
++          (!live.empty() && !(key(live.back()) < key(ref))))
++      {
++        const bool motion = (r.prim_type() & PRIMITIVE_MOTION) != 0 || r.time_from() != 0.0f ||
++                            r.time_to() != 1.0f;
++        std::fprintf(stderr,
++                     "FRAMEPIPE_BVH miss=%s stage=input refs=%zu cap=%zu limit=%zu type=%d\n",
++                     motion ? "motion" : "unsupported-input",
++                     refs,
++                     cap,
++                     exchange_limit,
++                     r.prim_type());
++        return nullptr;
++      }
++      live.push_back(ref);
++    }
++    if (!capture.empty() && !framepipe::write_snapshot(capture, live)) {
++      std::fprintf(stderr, "FRAMEPIPE_BVH capture=failed\n");
++    }
++    if (busy) {
++      return nullptr;
++    }
++    const size_t expected_time = ready && builder.params.use_motion_steps() ?
++                                     ready->source.size() :
++                                     0;
++    if (ready && ready->target == s.generation && ready->root &&
++        ready->time.size() != expected_time)
++    {
++      /* The producer's native builder must have supplied the current TLAS
++       * time layout before pack_instances() appends the current frame's BLAS. */
++      std::fprintf(stderr,
++                   "FRAMEPIPE_BVH miss=time-layout refs=%zu expected=%zu got=%zu\n",
++                   refs,
++                   expected_time,
++                   ready->time.size());
++    }
++    else if (ready && ready->target == s.generation && ready->root) {
++      const bool identity =
++          ready->source.size() == live.size() &&
++          std::equal(live.begin(), live.end(), ready->source.begin(), framepipe::same_identity);
++      if (identity) {
++        const bool exact = std::equal(
++            live.begin(), live.end(), ready->source.begin(), framepipe::same_input);
++        if (!exact) {
++          refit(*ready->root, live, ready->input_for_slot);
++        }
++        builder.prim_type.steal_data(ready->type);
++        builder.prim_index.steal_data(ready->index);
++        builder.prim_object.steal_data(ready->object);
++        builder.prim_time.steal_data(ready->time);
++        result = std::move(ready->root);
++        std::fprintf(
++            stderr, "FRAMEPIPE_BVH hit=%s refs=%zu\n", exact ? "exact" : "refit", live.size());
++      }
++      else {
++        std::fprintf(stderr, "FRAMEPIPE_BVH miss=identity\n");
++      }
++    }
++    else {
++      std::fprintf(stderr, "FRAMEPIPE_BVH miss=%s\n", ready ? "stale-or-invalid" : "cold");
++    }
++    ready.reset();
++    const bool last = env_value("CYCLES_FRAMEPIPE_LAST") == "1";
++    if (!last && live.size() <= limit) {
++      auto pending = make_unique<Job>();
++      pending->source = std::move(live);
++      pending->params = builder.params;
++      pending->target = s.generation + 1;
++      pending->cap = cap;
++      pending->limit = limit;
++      pending->next = env_value("CYCLES_FRAMEPIPE_NEXT");
++      s.pending = std::move(pending);
++    }
++    else if (!last && live.size() > limit) {
++      std::fprintf(stderr,
++                   "FRAMEPIPE_BVH miss=memory stage=next refs=%zu cap=%zu limit=%zu\n",
++                   live.size(),
++                   cap,
++                   limit);
++    }
++  }
++  catch (const std::exception &e) {
++    std::fprintf(stderr, "FRAMEPIPE_BVH miss=staging (%s)\n", e.what());
++  }
++  return result;
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/bvh/frame_lookahead.h b/intern/cycles/bvh/frame_lookahead.h
+new file mode 100644
+index 00000000..00683b7b
+--- /dev/null
++++ b/intern/cycles/bvh/frame_lookahead.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++
++#include "util/unique_ptr.h"
++
++CCL_NAMESPACE_BEGIN
++
++class BVHBuild;
++class BVHNode;
++
++/* One owner per persistent scene. exchange() and start() are called serially by
++ * the scene update/render loop. The worker owns only copied primitive inputs. */
++class BVHFrameLookahead {
++ public:
++  BVHFrameLookahead();
++  ~BVHFrameLookahead();
++  static bool enabled();
++  unique_ptr<BVHNode> exchange(BVHBuild &builder);
++  void start();
++
++ private:
++  struct State;
++  struct Job;
++  static void prepare(Job &job);
++  unique_ptr<State> state_;
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/bvh/frame_snapshot.h b/intern/cycles/bvh/frame_snapshot.h
+new file mode 100644
+index 00000000..0c39af32
+--- /dev/null
++++ b/intern/cycles/bvh/frame_snapshot.h
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <new>
++#include <string>
++#include <type_traits>
++#include <vector>
++
++namespace framepipe {
++
++// One aligned, motion-free top-level BVH reference before the builder reorders it.
++// Object references have prim_index == -1. Indices are Cycles indices, not Blender IDs.
++struct SnapshotRef {
++  std::array<float, 3> lo;
++  std::array<float, 3> hi;
++  std::int32_t prim_index;
++  std::int32_t prim_object;
++  std::int32_t prim_type;
++  std::uint32_t visibility;
++};
++
++static_assert(std::is_trivially_copyable_v<SnapshotRef>);
++static_assert(sizeof(SnapshotRef) == 40 && std::numeric_limits<float>::is_iec559);
++
++inline bool finite_coordinate(float value)
++{
++  // The production renderer compiles with /fp:fast. Inspect the exponent to reject
++  // malformed cache input even when the optimizer assumes floating values are finite.
++  std::uint32_t bits;
++  std::memcpy(&bits, &value, sizeof(bits));
++  return (bits & 0x7f800000u) != 0x7f800000u;
++}
++
++inline bool valid_snapshot_ref(const SnapshotRef &ref)
++{
++  if (ref.prim_object < 0 || ref.prim_index < -1) {
++    return false;
++  }
++  for (size_t axis = 0; axis < 3; ++axis) {
++    if (!finite_coordinate(ref.lo[axis]) || !finite_coordinate(ref.hi[axis]) ||
++        ref.lo[axis] > ref.hi[axis]) {
++      return false;
++    }
++  }
++  return true;
++}
++
++inline bool same_identity(const SnapshotRef &left, const SnapshotRef &right)
++{
++  return left.prim_index == right.prim_index && left.prim_object == right.prim_object &&
++         left.prim_type == right.prim_type;
++}
++
++inline bool same_input(const SnapshotRef &left, const SnapshotRef &right)
++{
++  // No padding (see size assertion above). Bitwise comparison includes bounds and visibility.
++  return std::memcmp(&left, &right, sizeof(SnapshotRef)) == 0;
++}
++
++namespace snapshot_format {
++inline constexpr std::array<char, 8> signature = {'C', 'F', 'B', 'V', 'H', '0', '0', '1'};
++inline constexpr std::uintmax_t header_size = signature.size() + sizeof(std::uint64_t);
++inline bool supported_host()
++{
++  const std::uint32_t one = 1;
++  return *reinterpret_cast<const unsigned char *>(&one) == 1;
++}
++}  // namespace snapshot_format
++
++// A cache file is only a prediction. The consumer must still match the references or refit
++// every leaf and parent with current data before using the tree for tracing.
++inline bool read_snapshot(const std::filesystem::path &path,
++                          const std::size_t max_refs,
++                          std::vector<SnapshotRef> &out)
++{
++  out.clear();
++  if (path.empty() || !snapshot_format::supported_host()) {
++    return false;
++  }
++  std::error_code error;
++  const auto file_size = std::filesystem::file_size(path, error);
++  if (error || file_size < snapshot_format::header_size) {
++    return false;
++  }
++  std::ifstream input(path, std::ios::binary);
++  std::array<char, 8> signature{};
++  std::uint64_t count = 0;
++  if (!input.read(signature.data(), signature.size()) ||
++      signature != snapshot_format::signature ||
++      !input.read(reinterpret_cast<char *>(&count), sizeof(count)) || count > max_refs ||
++      count > out.max_size() ||
++      count > std::uint64_t(std::numeric_limits<std::streamsize>::max()) / sizeof(SnapshotRef)) {
++    return false;
++  }
++  const auto bytes = count * sizeof(SnapshotRef);
++  if (bytes != file_size - snapshot_format::header_size) {
++    return false;
++  }
++  try {
++    out.resize(static_cast<std::size_t>(count));
++  }
++  catch (const std::bad_alloc &) {
++    return false;
++  }
++  if ((bytes && !input.read(reinterpret_cast<char *>(out.data()), std::streamsize(bytes))) ||
++      !std::all_of(out.begin(), out.end(), valid_snapshot_ref)) {
++    out.clear();
++    return false;
++  }
++  return true;
++}
++
++inline bool write_snapshot(const std::filesystem::path &path,
++                           const std::vector<SnapshotRef> &refs)
++{
++  if (path.empty() || !snapshot_format::supported_host() ||
++      refs.size() > std::uint64_t(std::numeric_limits<std::streamsize>::max()) /
++                        sizeof(SnapshotRef) ||
++      !std::all_of(refs.begin(), refs.end(), valid_snapshot_ref)) {
++    return false;
++  }
++  const std::uint64_t count = refs.size();
++  // Claim a distinct sibling directory atomically, including when two render jobs share a cache.
++  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++  std::filesystem::path temp_dir;
++  std::error_code error;
++  bool acquired = false;
++  for (int attempt = 0; attempt < 8 && !acquired; ++attempt) {
++    temp_dir = path;
++    temp_dir += ".tmp-" + std::to_string(stamp) + "-" + std::to_string(attempt);
++    acquired = std::filesystem::create_directory(temp_dir, error);
++    if (error) {
++      return false;
++    }
++  }
++  if (!acquired) {
++    return false;
++  }
++  const auto temp_file = temp_dir / "data";
++  std::ofstream output(temp_file, std::ios::binary);
++  output.write(snapshot_format::signature.data(), snapshot_format::signature.size());
++  output.write(reinterpret_cast<const char *>(&count), sizeof(count));
++  if (!refs.empty()) {
++    output.write(reinterpret_cast<const char *>(refs.data()),
++                 std::streamsize(refs.size() * sizeof(SnapshotRef)));
++  }
++  output.close();
++  bool published = false;
++  if (output) {
++    std::filesystem::rename(temp_file, path, error);
++    published = !error;
++  }
++  std::filesystem::remove(temp_file, error);
++  std::filesystem::remove(temp_dir, error);
++  return published;
++}
++
++}  // namespace framepipe
+diff --git a/intern/cycles/scene/geometry_bvh.cpp b/intern/cycles/scene/geometry_bvh.cpp
+index 700c12f1..d57d92a4 100644
+--- a/intern/cycles/scene/geometry_bvh.cpp
++++ b/intern/cycles/scene/geometry_bvh.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "bvh/bvh.h"
+ #include "bvh/bvh2.h"
++#include "bvh/frame_lookahead.h"
+ #include "bvh/params.h"
+ 
+ #include "device/device.h"
+@@ -125,6 +126,18 @@ void GeometryManager::device_update_bvh(Device *device,
+     bvh = scene->bvh.get();
+   }
+ 
++  if (bparams.bvh_layout == BVH_LAYOUT_BVH2 && scene->params.background &&
++      (device->info.type == DEVICE_HIP || device->info.type == DEVICE_CPU) &&
++      BVHFrameLookahead::enabled())
++  {
++    if (!scene->frame_lookahead) {
++      scene->frame_lookahead = make_unique<BVHFrameLookahead>();
++    }
++    static_cast<BVH2 *>(bvh)->frame_lookahead = scene->frame_lookahead.get();
++  }
++  else if (bparams.bvh_layout == BVH_LAYOUT_BVH2) {
++    static_cast<BVH2 *>(bvh)->frame_lookahead = nullptr;
++  }
+   device->build_bvh(bvh, progress, can_refit);
+ 
+   if (progress.get_cancel()) {
+diff --git a/intern/cycles/scene/scene.cpp b/intern/cycles/scene/scene.cpp
+index cf58010d..f8ca14fa 100644
+--- a/intern/cycles/scene/scene.cpp
++++ b/intern/cycles/scene/scene.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdlib>
+ 
+ #include "bvh/bvh.h"
++#include "bvh/frame_lookahead.h"
+ 
+ #include "device/device.h"
+ 
+diff --git a/intern/cycles/scene/scene.h b/intern/cycles/scene/scene.h
+index 613e3414..dfb686a8 100644
+--- a/intern/cycles/scene/scene.h
++++ b/intern/cycles/scene/scene.h
+@@ -23,6 +23,7 @@ CCL_NAMESPACE_BEGIN
+ class AttributeRequestSet;
+ class Background;
+ class BVH;
++class BVHFrameLookahead;
+ class Camera;
+ class Device;
+ class DeviceInfo;
+@@ -140,6 +141,7 @@ class Scene : public NodeOwner {
+ 
+   /* data */
+   unique_ptr<BVH> bvh;
++  unique_ptr<BVHFrameLookahead> frame_lookahead;
+   unique_ptr<LookupTables> lookup_tables;
+ 
+   Camera *camera;
+diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.cpp
+index 26b4501d..595131cb 100644
+--- a/intern/cycles/session/session.cpp
++++ b/intern/cycles/session/session.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <cstring>
+ 
++#include "bvh/frame_lookahead.h"
+ #include "device/cpu/device.h"
+ #include "device/device.h"
+ #include "integrator/path_trace.h"
+@@ -217,6 +218,9 @@ void Session::run_main_render_loop()
+       update_status_time();
+ 
+       /* render */
++      if (scene->frame_lookahead && render_work.path_trace.num_samples > 0) {
++        scene->frame_lookahead->start();
++      }
+       path_trace_->render(render_work);
+ 
+       /* update status and timing */

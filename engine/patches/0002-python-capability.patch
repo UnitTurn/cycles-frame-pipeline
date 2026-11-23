@@ -1,0 +1,12 @@
+diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
+index adf00e7a..522f8820 100644
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -879,6 +879,7 @@ CCL_NAMESPACE_END
+ void *blender::CCL_python_module_init()
+ {
+   PyObject *mod = PyModule_Create(&ccl::module);
++  PyModule_AddObjectRef(mod, "with_bvh_lookahead", Py_True);
+ 
+ #ifdef WITH_OSL
+   /* TODO(sergey): This gives us library we've been linking against.

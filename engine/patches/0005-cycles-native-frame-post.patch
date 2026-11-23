@@ -1,0 +1,315 @@
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "session/denoising.h"
+ #include "session/merge.h"
++#include "session/tile.h"
+ 
+ #include "util/colorspace.h"
+ #include "util/debug.h"
+@@ -498,6 +499,31 @@
+   Py_DECREF(sequence);
+ 
+   return true;
++}
++
++static PyObject *native_frame_paths_func(PyObject * /*self*/, PyObject *args)
++{
++  const char *capture;
++  const char *replay;
++  int inline_reference = 0;
++  if (!PyArg_ParseTuple(args, "ss|p", &capture, &replay, &inline_reference)) {
++    return nullptr;
++  }
++  if (*capture && *replay) {
++    PyErr_SetString(PyExc_ValueError, "Capture and replay must run in separate workers");
++    return nullptr;
++  }
++  if (inline_reference && !*capture) {
++    PyErr_SetString(PyExc_ValueError, "Inline reference requires a capture file");
++    return nullptr;
++  }
++  native_frame_set_paths(capture, replay, inline_reference != 0);
++  Py_RETURN_NONE;
++}
++
++static PyObject *native_frame_done_func(PyObject * /*self*/, PyObject * /*args*/)
++{
++  return PyBool_FromLong(native_frame_complete());
+ }
+ 
+ static PyObject *denoise_func(PyObject * /*self*/, PyObject *args, PyObject *keywords)
+@@ -835,6 +861,8 @@
+ 
+     /* Standalone denoising */
+     {"denoise", (PyCFunction)denoise_func, METH_VARARGS | METH_KEYWORDS, ""},
++    {"native_frame_paths", native_frame_paths_func, METH_VARARGS, ""},
++    {"native_frame_done", native_frame_done_func, METH_NOARGS, ""},
+     {"merge", (PyCFunction)merge_func, METH_VARARGS | METH_KEYWORDS, ""},
+ 
+     /* Debugging routines */
+@@ -880,6 +908,7 @@
+ {
+   PyObject *mod = PyModule_Create(&ccl::module);
+   PyModule_AddObjectRef(mod, "with_bvh_lookahead", Py_True);
++  PyModule_AddObjectRef(mod, "with_native_frame_post", Py_True);
+ 
+ #ifdef WITH_OSL
+   /* TODO(sergey): This gives us library we've been linking against.
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -348,6 +348,13 @@
+   ensure_display_driver_if_needed();
+   session->set_output_driver(make_unique<BlenderOutputDriver>(b_engine));
+ 
++  const string replay = native_frame_replay_path();
++  if (!replay.empty()) {
++    session->process_full_buffer_from_disk(replay);
++    check_and_report_session_error();
++    return;
++  }
++
+   session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
+ 
+   blender::ViewLayer &b_view_layer = *DEG_get_evaluated_view_layer(b_depsgraph);
+--- a/intern/cycles/integrator/path_trace.cpp
++++ b/intern/cycles/integrator/path_trace.cpp
+@@ -237,7 +237,21 @@
+     return;
+   }
+ 
+-  denoise(render_work);
++  if (native_frame_is_inline_reference()) {
++    if (tile_manager_.has_multiple_tiles()) {
++      progress_->set_error("Inline reference capture requires a single render tile");
++      progress_->set_cancel("Inline reference capture requires a single render tile");
++      return;
++    }
++    if (render_work.tile.denoise && !native_frame_complete()) {
++      /* Diagnostic only: freeze the film before native inline denoising operates on it. */
++      tile_buffer_write_to_disk();
++      tile_manager_.finish_write_tiles();
++    }
++  }
++  if (!native_frame_is_capturing() || native_frame_is_inline_reference()) {
++    denoise(render_work);
++  }
+   if (render_cancel_.is_requested) {
+     return;
+   }
+@@ -866,6 +880,14 @@
+ 
+   const bool has_multiple_tiles = tile_manager_.has_multiple_tiles();
+ 
++  if (native_frame_is_capturing() && !native_frame_is_inline_reference()) {
++    tile_buffer_write_to_disk();
++    if (!has_multiple_tiles) {
++      tile_manager_.finish_write_tiles();
++    }
++    return;
++  }
++
+   /* Write render tile result, but only if not using tiled rendering.
+    *
+    * Tiles are written to a file during rendering, and written to the software at the end
+@@ -1117,11 +1139,16 @@
+ 
+   render_state_.has_denoised_result = false;
+ 
+-  if (denoise_params.use && denoiser_ && !progress_->get_cancel()) {
++  const bool replay = !native_frame_replay_path().empty();
++  if (replay && (!denoise_params.use || denoise_params.type != DENOISER_OPENIMAGEDENOISE)) {
++    progress_->set_error("Native frame replay requires a CPU OpenImageDenoise buffer");
++    return;
++  }
++  if (denoise_params.use && (denoiser_ || replay) && !progress_->get_cancel()) {
+     progress_set_status(layer_view_name, "Denoising");
+ 
+     /* If GPU should be used is not based on file metadata. */
+-    denoise_params.use_gpu = render_scheduler_.is_denoiser_gpu_used();
++    denoise_params.use_gpu = !replay && render_scheduler_.is_denoiser_gpu_used();
+ 
+     /* Re-use the denoiser as much as possible, avoiding possible device re-initialization.
+      *
+@@ -1132,8 +1159,11 @@
+     set_denoiser_params(denoise_params);
+ 
+     /* Number of samples doesn't matter too much, since the samples count pass will be used. */
+-    denoiser_->denoise_buffer(
+-        full_frame_buffers.params, full_frame_buffers.params, &full_frame_buffers, 0, false);
++    if (!denoiser_ || !denoiser_->denoise_buffer(
++          full_frame_buffers.params, full_frame_buffers.params, &full_frame_buffers, 0, false)) {
++      progress_->set_error("Failed to denoise the native frame buffer");
++      return;
++    }
+ 
+     render_state_.has_denoised_result = true;
+   }
+@@ -1147,6 +1177,9 @@
+   tile_buffer_write();
+ 
+   full_frame_state_.render_buffers = nullptr;
++  if (replay && !progress_->get_cancel() && !progress_->get_error()) {
++    native_frame_mark_complete();
++  }
+ }
+ 
+ int PathTrace::get_num_render_tile_samples() const
+@@ -1228,6 +1261,10 @@
+ 
+ int2 PathTrace::get_render_size() const
+ {
++  if (full_frame_state_.render_buffers) {
++    return make_int2(full_frame_state_.render_buffers->params.width,
++                     full_frame_state_.render_buffers->params.height);
++  }
+   return tile_manager_.get_size();
+ }
+ 
+--- a/intern/cycles/session/session.cpp
++++ b/intern/cycles/session/session.cpp
+@@ -724,7 +724,7 @@
+ 
+   /* When multiple tiles are used SAMPLE_COUNT pass is used to keep track of possible partial
+    * tile results. */
+-  scene->film->set_use_sample_count(tile_manager_.has_multiple_tiles());
++  scene->film->set_use_sample_count(tile_manager_.has_multiple_tiles() || native_frame_is_capturing());
+ 
+   const bool reset = scene->need_reset(false);
+ 
+--- a/intern/cycles/session/tile.cpp
++++ b/intern/cycles/session/tile.cpp
+@@ -5,6 +5,7 @@
+ #include "session/tile.h"
+ 
+ #include <atomic>
++#include <mutex>
+ 
+ #include "graph/node.h"
+ #include "scene/background.h"
+@@ -22,6 +23,55 @@
+ #include "util/types.h"
+ 
+ CCL_NAMESPACE_BEGIN
++
++static std::mutex native_frame_mutex;
++static string native_frame_capture;
++static string native_frame_replay;
++static std::atomic<bool> native_frame_capturing(false);
++static std::atomic<bool> native_frame_inline_reference(false);
++static std::atomic<bool> native_frame_completed(false);
++
++void native_frame_set_paths(const string &capture, const string &replay, const bool inline_reference)
++{
++  std::lock_guard<std::mutex> lock(native_frame_mutex);
++  native_frame_capture = capture;
++  native_frame_replay = replay;
++  native_frame_completed.store(false);
++  native_frame_inline_reference.store(inline_reference);
++  native_frame_capturing.store(!capture.empty());
++}
++
++bool native_frame_is_capturing()
++{
++  return native_frame_capturing.load(std::memory_order_relaxed);
++}
++
++bool native_frame_is_inline_reference()
++{
++  return native_frame_inline_reference.load(std::memory_order_relaxed);
++}
++
++string native_frame_capture_path()
++{
++  std::lock_guard<std::mutex> lock(native_frame_mutex);
++  return native_frame_capture;
++}
++
++string native_frame_replay_path()
++{
++  std::lock_guard<std::mutex> lock(native_frame_mutex);
++  return native_frame_replay;
++}
++
++void native_frame_mark_complete()
++{
++  native_frame_completed.store(true);
++}
++
++bool native_frame_complete()
++{
++  return native_frame_completed.load();
++}
+ 
+ /* --------------------------------------------------------------------
+  * Internal functions.
+@@ -355,10 +405,13 @@
+ 
+   buffer_params_ = params;
+ 
+-  if (has_multiple_tiles()) {
++  if (has_multiple_tiles() || native_frame_is_capturing()) {
+     /* TODO(sergey): Proper Error handling, so that if configuration has failed we don't attempt to
+      * write to a partially configured file. */
+     configure_image_spec_from_buffer(&write_state_.image_spec, buffer_params_, tile_size_);
++    if (native_frame_is_capturing()) {
++      write_state_.image_spec.attribute("compression", "none");
++    }
+ 
+     const DenoiseParams denoise_params = scene->integrator->get_denoise_params();
+     const AdaptiveSampling adaptive_sampling = scene->integrator->get_adaptive_sampling();
+@@ -368,7 +421,7 @@
+ 
+     /* Not adaptive sampling overscan yet for baking, would need overscan also
+      * for buffers read from the output driver. */
+-    if (adaptive_sampling.use && !scene->bake_manager->get_baking()) {
++    if (has_multiple_tiles() && adaptive_sampling.use && !scene->bake_manager->get_baking()) {
+       overscan_ = 4;
+     }
+     else {
+@@ -447,6 +500,9 @@
+   write_state_.filename = path_join(temp_dir_,
+                                     "cycles-tile-buffer-" + tile_file_unique_part_ + "-" +
+                                         to_string(write_state_.tile_file_index) + ".exr");
++  if (native_frame_is_capturing()) {
++    write_state_.filename = native_frame_capture_path();
++  }
+ 
+   write_state_.tile_out = ImageOutput::create(write_state_.filename);
+   if (!write_state_.tile_out) {
+@@ -608,9 +664,13 @@
+     }
+   }
+ 
+-  close_tile_output();
+-
+-  if (full_buffer_written_cb) {
++  const bool closed = close_tile_output();
++  if (native_frame_is_capturing()) {
++    if (closed && write_state_.num_tiles_written == tile_state_.num_tiles) {
++      native_frame_mark_complete();
++    }
++  }
++  else if (full_buffer_written_cb) {
+     full_buffer_written_cb(write_state_.filename);
+   }
+ 
+--- a/intern/cycles/session/tile.h
++++ b/intern/cycles/session/tile.h
+@@ -16,6 +16,15 @@
+ 
+ class DenoiseParams;
+ class Scene;
++
++/* Process-local handoff used only by a dedicated background Blender worker. */
++void native_frame_set_paths(const string &capture, const string &replay, bool inline_reference);
++bool native_frame_is_capturing();
++bool native_frame_is_inline_reference();
++string native_frame_capture_path();
++string native_frame_replay_path();
++void native_frame_mark_complete();
++bool native_frame_complete();
+ 
+ /* --------------------------------------------------------------------
+  * Tile.

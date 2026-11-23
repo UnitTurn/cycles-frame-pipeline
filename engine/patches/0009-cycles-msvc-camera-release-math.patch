@@ -1,0 +1,144 @@
+diff --git a/intern/cycles/blender/camera.cpp b/intern/cycles/blender/camera.cpp
+index f935b1bb..2d662b11 100644
+--- a/intern/cycles/blender/camera.cpp
++++ b/intern/cycles/blender/camera.cpp
+@@ -10,6 +10,7 @@
+ #include "blender/sync.h"
+ #include "blender/util.h"
+ 
++#include "util/framepipe_camera_math.h"
+ #include "util/log.h"
+ 
+ #include "BKE_action.hh"
+@@ -393,7 +394,7 @@ static Transform blender_camera_matrix(const Transform &tfm,
+     result = tfm * transform_scale(1.0f, 1.0f, -1.0f);
+   }
+ 
+-  return transform_clear_scale(result);
++  return framepipe_camera_clear_scale(result);
+ }
+ 
+ static void blender_camera_viewplane(BlenderCamera *bcam,
+diff --git a/intern/cycles/scene/camera.cpp b/intern/cycles/scene/camera.cpp
+index 38409bb0..f140ddaf 100644
+--- a/intern/cycles/scene/camera.cpp
++++ b/intern/cycles/scene/camera.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include "device/device.h"
+ 
++#include "util/framepipe_camera_math.h"
+ #include "util/log.h"
+ #include "util/math_cdf.h"
+ #include "util/tbb.h"
+@@ -251,7 +252,7 @@ void Camera::update(Scene *scene)
+   /* Screen to camera. */
+   ProjectionTransform cameratoscreen;
+   if (camera_type == CAMERA_PERSPECTIVE) {
+-    cameratoscreen = projection_perspective(fov, nearclip, farclip);
++    cameratoscreen = framepipe_camera_perspective(fov, nearclip, farclip);
+   }
+   else if (camera_type == CAMERA_ORTHOGRAPHIC) {
+     cameratoscreen = projection_orthographic(nearclip, farclip);
+@@ -267,7 +268,7 @@ void Camera::update(Scene *scene)
+ 
+ #ifdef FIX_CUSTOM_CAMERA_CRASH
+   if (camera_type == CAMERA_CUSTOM) {
+-    const ProjectionTransform full_cameratoscreen = projection_perspective(fov, nearclip, farclip);
++    const ProjectionTransform full_cameratoscreen = framepipe_camera_perspective(fov, nearclip, farclip);
+     const ProjectionTransform full_screentocamera = projection_inverse(full_cameratoscreen);
+     full_rastertocamera = full_screentocamera * full_rastertoscreen;
+   }
+@@ -378,8 +379,8 @@ void Camera::update(Scene *scene)
+         ProjectionTransform cameratoscreen_pre = cameratoscreen;
+         ProjectionTransform cameratoscreen_post = cameratoscreen;
+         if (camera_type == CAMERA_PERSPECTIVE) {
+-          cameratoscreen_pre = projection_perspective(fov_pre, nearclip, farclip);
+-          cameratoscreen_post = projection_perspective(fov_post, nearclip, farclip);
++          cameratoscreen_pre = framepipe_camera_perspective(fov_pre, nearclip, farclip);
++          cameratoscreen_post = framepipe_camera_perspective(fov_post, nearclip, farclip);
+         }
+ 
+         const ProjectionTransform cameratoraster_pre = screentoraster * cameratoscreen_pre;
+@@ -410,9 +411,9 @@ void Camera::update(Scene *scene)
+     /* TODO(sergey): Support other types of camera. */
+     if (use_perspective_motion && camera_type == CAMERA_PERSPECTIVE) {
+       const ProjectionTransform screentocamera_pre = projection_inverse(
+-          projection_perspective(fov_pre, nearclip, farclip));
++          framepipe_camera_perspective(fov_pre, nearclip, farclip));
+       const ProjectionTransform screentocamera_post = projection_inverse(
+-          projection_perspective(fov_post, nearclip, farclip));
++          framepipe_camera_perspective(fov_post, nearclip, farclip));
+ 
+       kcam->perspective_pre = screentocamera_pre * rastertoscreen;
+       kcam->perspective_post = screentocamera_post * rastertoscreen;
+diff --git a/intern/cycles/util/framepipe_camera_math.h b/intern/cycles/util/framepipe_camera_math.h
+new file mode 100644
+index 00000000..3cddecb9
+--- /dev/null
++++ b/intern/cycles/util/framepipe_camera_math.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++
++#include "util/projection.h"
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef WITH_FRAMEPIPE_RELEASE_CAMERA_MATH
++/* The Windows compatibility build shares only POD pointers with the release
++ * compiler. Keep Blender/Cycles classes and their allocators in the host ABI. */
++extern "C" void ccl_framepipe_camera_strip_scale(const Transform *input, Transform *result);
++extern "C" void ccl_framepipe_camera_project(float fov, float nearclip, float farclip,
++                                             ProjectionTransform *result);
++
++inline Transform framepipe_camera_clear_scale(const Transform &input)
++{
++  Transform result;
++  ccl_framepipe_camera_strip_scale(&input, &result);
++  return result;
++}
++inline ProjectionTransform framepipe_camera_perspective(float fov, float nearclip, float farclip)
++{
++  ProjectionTransform result;
++  ccl_framepipe_camera_project(fov, nearclip, farclip, &result);
++  return result;
++}
++#else
++inline Transform framepipe_camera_clear_scale(const Transform &input)
++{
++  return transform_clear_scale(input);
++}
++inline ProjectionTransform framepipe_camera_perspective(float fov, float nearclip, float farclip)
++{
++  return projection_perspective(fov, nearclip, farclip);
++}
++#endif
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/util/framepipe_camera_math.cpp b/intern/cycles/util/framepipe_camera_math.cpp
+new file mode 100644
+index 00000000..e0bd952f
+--- /dev/null
++++ b/intern/cycles/util/framepipe_camera_math.cpp
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#include "util/framepipe_camera_math.h"
++
++CCL_NAMESPACE_BEGIN
++
++static_assert(sizeof(Transform) == 12 * sizeof(float));
++static_assert(sizeof(ProjectionTransform) == 16 * sizeof(float));
++
++extern "C" void ccl_framepipe_camera_strip_scale(const Transform *input, Transform *result)
++{
++  *result = transform_clear_scale(*input);
++}
++
++extern "C" void ccl_framepipe_camera_project(float fov, float nearclip, float farclip,
++                                            ProjectionTransform *result)
++{
++  *result = projection_perspective(fov, nearclip, farclip);
++}
++
++CCL_NAMESPACE_END

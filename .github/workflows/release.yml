@@ -1,0 +1,37 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Package the extension and corresponding project sources
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'from pathlib import Path; import tomllib; print(tomllib.loads(Path("extension/blender_manifest.toml").read_text())["version"])')
+          test "$TAG" = "v$version"
+          python3 tools/package.py
+      - name: Retrieve the tested Windows overlay and verify its digest
+        run: |
+          set -euo pipefail
+          name="cycles-frame-pipeline-windows-x64-${TAG#v}.zip"
+          git fetch --no-tags --depth=1 origin "refs/heads/release-input/$TAG"
+          git show "FETCH_HEAD:$name" > "dist/$name"
+          (cd dist && sha256sum -c ../release/windows-overlay.sha256)
+      - name: Publish all three assets together
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/*.zip --verify-tag --title "Cycles Frame Pipeline $TAG" --notes-file release/notes.md
