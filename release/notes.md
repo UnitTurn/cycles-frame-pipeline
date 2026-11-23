@@ -1,27 +1,16 @@
-# Cycles Frame Pipeline 0.3.1
+# Cycles Frame Pipeline 0.4.0
 
-[简体中文发布说明](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/release/notes.zh-CN.md)
+[简体中文发布说明](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/release/notes.zh-CN.md)
 
-Choose the matching English or Simplified Chinese extension and Windows engine package. Each package uses one language. The two extensions share a Blender extension ID, and both engine packages contain the same rendering executable.
+This Windows x64 release adds NVIDIA CUDA and OptiX to the engine alongside AMD HIP. CUDA uses the existing software BVH2 validation and reuse path. OptiX builds native acceleration structures in the session preparing the next frame. All three backends can overlap GPU sampling with CPU Open Image Denoise and PNG output for supported scenes.
 
-After installation, use `open_blender.ps1` in the new runtime directory to open Blender in the selected language. Install the matching extension ZIP in that window. Each language edition keeps its own preferences and enabled extensions between launches.
+Use the official Blender 5.2.1 LTS installation (upstream commit `9e2066aef7ef`) and download an extension and engine overlay in the same language. In Cycles preferences select the GPU backend and the card, set the render device to GPU Compute, and choose the extension's scene settings profile.
 
-| Download | English | Simplified Chinese |
+| Download | English | 简体中文 |
 |---|---|---|
-| Blender extension | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-0.3.1-en.zip) | [Chinese ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-0.3.1-zh-CN.zip) |
-| Windows x64 engine | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles-frame-pipeline-windows-x64-0.3.1-en.zip) | [Chinese ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles-frame-pipeline-windows-x64-0.3.1-zh-CN.zip) |
+| Blender extension | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-en.zip) | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-zh-CN.zip) |
+| Windows x64 engine | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-en.zip) | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-zh-CN.zip) |
 
-The overlay requires official Blender 5.2.1 LTS for Windows x64, upstream build `9e2066aef7ef`. Install the extension from disk in Blender. [Installation and usage](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/README.md) · [Project source archive](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-source-0.3.1.zip)
+The RX 7800 XT has been tested with HIP and the RTX 3090 with CUDA and OptiX. Both NVIDIA backends produced consecutive frames in the regression scene. On the larger Ruins project, CUDA produced frames with both optimizations enabled before Windows reached its system commit limit. A full optimized Ruins sequence on the RTX 3090 remains unverified. Both device memory and available Windows system commit matter when preparing two frames.
 
-### Ten measured frames and a 1,000-frame projection
-
-| Frame count | Official Blender | Cycles Frame Pipeline | Time saved |
-|---|---:|---:|---:|
-| 10 measured | 560.25 s | 466.03 s | 94.22 s (16.82%) |
-| 1,000 projected | 11 h 29 min 41 s | 8 h 00 min 15 s | 3 h 29 min 26 s (30.37%) |
-
-The test used one RX 7800 XT. After the first PNG, average whole-card GPU utilization increased from 69.91% to 94.85%. Peak dedicated GPU memory rose from 8.62 to 12.29 GiB. All ten images were within one 8-bit RGB level of official Blender, with identical alpha. The projection charges each configuration for its first frame once, followed by 999 intervals at its measured average cadence over the next nine images. It assumes subsequent frames have similar rendering costs.
-
-![Measured and projected render-time reductions](https://raw.githubusercontent.com/expitau-one/cycles-frame-pipeline/v0.3.1/benchmarks/projection-en.png)
-
-[Benchmark charts, measurements and calculation](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/benchmarks/README.md)
+[Installation and theoretical GPU coverage](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/README.md#gpu-and-blender-compatibility) · [Project source ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-source-0.4.0.zip)

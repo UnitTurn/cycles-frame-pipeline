@@ -1,22 +1,16 @@
-# Cycles Frame Pipeline 0.3.1 发布说明
+# Cycles 帧间流水线 0.4.0
 
-请选择同一种语言的插件和 Windows 引擎包。中文版插件使用中文控件、提示和运行状态。中文版引擎包提供中文安装说明和提示。中英文插件共用同一个扩展 ID，两种引擎包使用相同的渲染程序。
+[English release notes](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/release/notes.md)
 
-安装后，在新的引擎目录运行 `open_blender.ps1` 打开中文 Blender，在该窗口从磁盘安装中文插件 ZIP。每种语言分别保存偏好设置和启用的扩展，下次打开时继续使用。
+Windows x64 引擎现在提供 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。CUDA 沿用软件 BVH2 的校验和复用逻辑。OptiX 在准备下一帧的会话中构建原生加速结构。满足场景条件时，三个后端都可以在 GPU 采样时，用 CPU 为已完成的帧执行 Open Image Denoise 并输出 PNG。
 
-[中文版 Blender 插件](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-0.3.1-zh-CN.zip) · [中文版 Windows x64 引擎包](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles-frame-pipeline-windows-x64-0.3.1-zh-CN.zip) · [通用项目源码包](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.3.1/cycles_frame_pipeline-source-0.3.1.zip)
+请使用官方 Windows x64 Blender 5.2.1 LTS（提交 `9e2066aef7ef`），下载同一种语言的扩展和引擎包。在 Cycles 偏好设置中选择后端并勾选显卡，渲染设备选择 GPU 计算，插件配置选择沿用场景设置。
 
-需要官方 Windows x64 Blender 5.2.1 LTS，提交 `9e2066aef7ef`。在 Blender 中从磁盘安装插件 ZIP，按引擎包内说明创建独立运行目录。[安装和使用](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/README.zh-CN.md)
+| 下载 | 简体中文 | English |
+|---|---|---|
+| Blender 扩展 | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-zh-CN.zip) | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-0.4.0-en.zip) |
+| Windows x64 引擎 | [中文 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-zh-CN.zip) | [English ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles-frame-pipeline-windows-x64-0.4.0-en.zip) |
 
-### 十帧实测与千帧推算
+已实机验证 RX 7800 XT 的 HIP，以及 RTX 3090 的 CUDA 和 OptiX。两种 NVIDIA 后端均在回归场景中连续出图。在较大的 Ruins 工程中，CUDA 开启两项优化后输出了部分帧，随后触及 Windows 系统提交内存上限。该卡的 Ruins 优化版完整序列尚待验证。准备双帧时需同时留出显存和系统提交内存。
 
-| 帧数 | 官方 Blender | 发布版 | 总耗时减少 |
-|---|---:|---:|---:|
-| 10 帧实测 | 560.25 秒 | 466.03 秒 | 94.22 秒（16.82%） |
-| 1,000 帧推算 | 11 小时 29 分 41 秒 | 8 小时 00 分 15 秒 | 3 小时 29 分 26 秒（30.37%） |
-
-RX 7800 XT 上，首张 PNG 写完之后的整卡 GPU 平均利用率从 69.91% 提升到 94.85%，专用显存峰值从 8.62 GiB 升至 12.29 GiB。十帧相对官方的最大 RGB 通道差均为 1/255，透明通道全部一致。千帧推算分别采用两组实测首帧耗时，加上 999 个后九帧平均出图间隔，假设后续帧的渲染复杂度相近。两行的降幅都以相同帧数下的官方总耗时为分母。
-
-![十帧实测与千帧推算的耗时降幅](https://raw.githubusercontent.com/expitau-one/cycles-frame-pipeline/v0.3.1/benchmarks/projection-zh.png)
-
-[实测图表、逐秒数据与推算方法](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.3.1/benchmarks/README.zh-CN.md)
+[安装和理论支持范围](https://github.com/expitau-one/cycles-frame-pipeline/blob/v0.4.0/README.zh-CN.md#显卡与-blender-兼容范围) · [项目源码 ZIP](https://github.com/expitau-one/cycles-frame-pipeline/releases/download/v0.4.0/cycles_frame_pipeline-source-0.4.0.zip)

@@ -70,11 +70,13 @@ def instructions(version, language):
     if language == "zh-CN":
         return f"""# Cycles Frame Pipeline {version} · Windows x64
 
-安装官方 Blender 5.2.1 LTS（构建 `9e2066aef7ef`），解压本包，在解压目录的 PowerShell 中运行以下命令。目标目录必须是新目录。安装器会读取本机官方运行时和 HIP 内核，创建独立的配套 Blender。
+安装官方 Blender 5.2.1 LTS（构建 `9e2066aef7ef`），解压本包，在解压目录的 PowerShell 中运行以下命令。目标目录必须是新目录。安装器会复制本机的官方运行时和 GPU 内核，创建启用 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX 的独立 Blender。
 
 {commands}
 
 运行 `.\\backend\\open_blender.ps1` 启动简体中文 Blender。在「编辑 → 偏好设置 → 获取扩展 → 菜单 → 从磁盘安装」中选择从[对应版本]({release})下载的 `{extension}`，使用默认用户扩展仓库并启用插件。
+
+在「编辑 → 偏好设置 → 系统」选择 HIP、CUDA 或 OptiX 并勾选对应 GPU，在 Cycles 渲染属性中选择 GPU 计算。插件的「使用场景设置」可保留此选择。
 
 启动器首次运行时复制现有 Blender 启动文件、偏好与默认用户扩展到 `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\zh_HANS`。以后的启动会继续使用这个中文配置。直接运行 `backend\\blender.exe` 使用常规 Blender 配置。从官方 Blender 提交作业时，可在插件偏好设置中将「定制 Blender 程序」指向新建的 `backend\\blender.exe`。
 
@@ -84,11 +86,13 @@ def instructions(version, language):
 """
     return f"""# Cycles Frame Pipeline {version} · Windows x64
 
-Install official Blender 5.2.1 LTS (build `9e2066aef7ef`). Extract this archive, open PowerShell in the extracted directory and run the command below. Choose a new destination directory. The installer copies your local official runtime and HIP kernels into a separate Blender installation.
+Install official Blender 5.2.1 LTS (build `9e2066aef7ef`). Extract this archive, open PowerShell in the extracted directory and run the command below. Choose a new destination directory. The installer copies your official runtime and GPU kernels into a separate Blender installation with AMD HIP, NVIDIA CUDA and NVIDIA OptiX enabled.
 
 {commands}
 
 Run `.\\backend\\open_blender.ps1` to launch Blender in English. Download `{extension}` from the [matching release]({release}). Choose **Edit → Preferences → Get Extensions → menu → Install from Disk**, install into the default user repository and enable the extension.
+
+In **Edit → Preferences → System**, select HIP, CUDA or OptiX and enable the GPU. Select **GPU Compute** in Cycles Render Properties and **Use Scene Settings** in the extension.
 
 On first launch, the launcher copies your existing Blender startup file, preferences and default user extension repositories to `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\en_US`. Future launches reuse this English profile. Starting `backend\\blender.exe` directly uses the regular Blender profile. To submit jobs from official Blender, point the extension's custom Blender executable preference to the new `backend\\blender.exe`.
 
@@ -139,6 +143,7 @@ def main():
             add(archive, "copyright.txt", (official/"copyright.txt").read_bytes())
             for notice in notices:
                 add(archive, notice.relative_to(official).as_posix(), notice.read_bytes())
+            add(archive, "license/others/NVIDIA-OptiX.md", (ROOT/"engine/OptiX-NOTICE.md").read_bytes())
             add(archive, "README.md", instructions(version, args.language).encode("utf-8"))
         staged.replace(output)
     print(f"{output} ({output.stat().st_size:,} bytes)")

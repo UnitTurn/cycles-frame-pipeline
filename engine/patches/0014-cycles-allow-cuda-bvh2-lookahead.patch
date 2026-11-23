@@ -1,0 +1,11 @@
+diff --git a/intern/cycles/scene/geometry_bvh.cpp b/intern/cycles/scene/geometry_bvh.cpp
+--- a/intern/cycles/scene/geometry_bvh.cpp
++++ b/intern/cycles/scene/geometry_bvh.cpp
+@@ -135,5 +135,6 @@ void GeometryManager::device_update_bvh(Device *device,
+   if (bparams.bvh_layout == BVH_LAYOUT_BVH2 && scene->params.background &&
+-      (device->info.type == DEVICE_HIP || device->info.type == DEVICE_CPU) &&
++      (device->info.type == DEVICE_HIP || device->info.type == DEVICE_CPU ||
++       device->info.type == DEVICE_CUDA) &&
+       BVHFrameLookahead::enabled())
+   {
+     if (!scene->frame_lookahead) {

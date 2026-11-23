@@ -14,9 +14,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $messagesFile = Join-Path $PSScriptRoot 'install-messages.psd1'
 $launcher = Join-Path $PSScriptRoot 'open_blender.ps1'
+$optixNotice = Join-Path $PSScriptRoot 'license\others\NVIDIA-OptiX.md'
 if (!(Test-Path -LiteralPath $messagesFile -PathType Leaf)) {
     $messagesFile = Join-Path $PSScriptRoot 'windows_release\en.psd1'
     $launcher = Join-Path $PSScriptRoot 'windows_release\open_blender.ps1'
+    $optixNotice = Join-Path (Split-Path -Parent $PSScriptRoot) 'engine\OptiX-NOTICE.md'
 }
 $messages = Import-PowerShellDataFile -LiteralPath $messagesFile
 if (!(Test-Path -LiteralPath (Join-Path $BlenderInstall 'blender.exe') -PathType Leaf)) {
@@ -37,7 +39,10 @@ if ($LASTEXITCODE -ne 0 -or !($stockVersion -match '9e2066aef7ef')) {
     throw ($messages.Version -f $stock)
 }
 $kernels = Join-Path $stock '5.2\scripts\addons_core\cycles\lib'
-if (!(Get-ChildItem -LiteralPath $kernels -Filter 'kernel_gfx*.fatbin.zst' -File)) {
+if (!(Get-ChildItem -LiteralPath $kernels -File | Where-Object {
+    $_.Name -like 'kernel_gfx*.fatbin.zst' -or $_.Name -like 'kernel_sm_*.cubin.zst' -or
+    $_.Name -like 'kernel_compute_*.ptx.zst' -or $_.Name -eq 'kernel_optix.ptx.zst'
+})) {
     throw ($messages.Kernels -f $kernels)
 }
 $parentDir = Split-Path -Parent $target
@@ -48,6 +53,7 @@ try {
     foreach ($dir in '5.2', 'blender.crt', 'blender.shared', 'license') {
         Copy-Item -LiteralPath (Join-Path $stock $dir) -Destination $staging -Recurse
     }
+    Copy-Item -LiteralPath $optixNotice -Destination (Join-Path $staging 'license\others\NVIDIA-OptiX.md')
     foreach ($file in 'blender_cpu_check.dll', 'python3.dll', 'python313.dll', 'ucrtbase.dll', 'copyright.txt') {
         Copy-Item -LiteralPath (Join-Path $stock $file) -Destination $staging
     }

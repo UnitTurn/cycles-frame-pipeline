@@ -4,7 +4,7 @@
     MissingBinary = 'Cannot find the patched Blender executable at {0}.'
     Destination = 'Choose a new directory outside the official Blender installation: {0}'
     Version = 'Select the official Blender 5.2.1 Windows x64 runtime (build 9e2066aef7ef): {0}'
-    Kernels = 'No HIP device kernels found in {0}.'
+    Kernels = 'Could not find any official HIP, CUDA or OptiX device kernels in {0}.'
     Load = 'The patched engine could not load its matching runtime.'
     Location = 'Unexpected installation directory.'
     Installed = 'Installed {0}'

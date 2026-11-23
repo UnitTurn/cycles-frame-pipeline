@@ -67,7 +67,7 @@ with zipfile.ZipFile(source_zip.with_suffix(".tmp"), "w", compression=zipfile.ZI
     public_sources = {
         "extension": {".py", ".toml", ".json"},
         "pipeline": {".py"},
-        "engine": {".py", ".ps1", ".patch", ".h", ".cpp", ".md"},
+        "engine": {".py", ".ps1", ".patch", ".h", ".cpp", ".md", ".cmake"},
         "tools": {".py", ".ps1", ".psd1"},
         "benchmarks": {".py", ".md", ".csv", ".png"},
         "docs": {".md"},

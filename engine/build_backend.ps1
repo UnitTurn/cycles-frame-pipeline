@@ -3,7 +3,8 @@
 Build the patched Blender 5.2.1 Windows x64 release with clang-cl 20.1.0.
 .DESCRIPTION
 Requires CMake, Ninja, the Windows 10.0.26100.0 SDK, MSVC 14.44 x64 headers,
-libraries and redistributables, and the matching official Blender HIP kernels.
+libraries and redistributables, and the matching official Blender GPU kernels.
+The script fetches the pinned OptiX 8.0.0 headers, or uses -OptixDir / OPTIX_ROOT_DIR.
 An existing work/official-toolchain layout is supported. Otherwise use clang-cl on PATH
 and VCToolsInstallDir/VCToolsRedistDir from an x64 Visual Studio Developer shell.
 Set -ClangDir, -MsvcDir, -RedistDir or -SdkDir for equivalent installations.
@@ -25,6 +26,7 @@ param(
     [string]$ClangDir,
     [string]$MsvcDir,
     [string]$RedistDir,
+    [string]$OptixDir = $env:OPTIX_ROOT_DIR,
     [string]$SdkDir = "${env:ProgramFiles(x86)}\Windows Kits\10",
     [string]$SdkVersion = '10.0.26100.0',
     [string]$BuildDir,
@@ -64,6 +66,7 @@ $build = Get-ProjectPath $BuildDir (Join-Path $work 'build-clang')
 $install = Get-ProjectPath $InstallDir (Join-Path $work 'clang-release')
 $upstream = '9e2066aef7ef7e20c142ad7bd3303138a4304c93'
 $libCommit = '60d6e96b917568278d400a4024c98da0fb777338'
+$optixCommit = 'f60c1e44f18426f426a2ed948f28515b3cf67b8a'
 $baseURL = 'https://projects.blender.org/blender'
 $gitOpts = @()
 if ($PSBoundParameters.ContainsKey('GitProxy')) { $gitOpts = @('-c', "http.proxy=$GitProxy") }
@@ -91,7 +94,7 @@ New-Item -Force -ItemType Directory $work | Out-Null
 $cm = Use-Tool $CMake (Join-Path $work 'pytools/cmake/data/bin/cmake.exe') 'cmake'
 $nj = Use-Tool $Ninja (Join-Path $work 'pytools/bin/ninja.exe') 'ninja'
 $stockExe = Join-Path $BlenderInstall 'blender.exe'
-if (!(Test-Path -LiteralPath $stockExe)) { throw "Blender 5.2.1 is required for matching precompiled HIP kernels: $stockExe" }
+if (!(Test-Path -LiteralPath $stockExe)) { throw "Blender 5.2.1 is required for matching precompiled GPU kernels: $stockExe" }
 $version = & $stockExe --version
 if (!($version -match $upstream.Substring(0,12))) { throw 'The installed GPU kernels must match Blender 5.2.1 (9e2066aef7ef).' }
 
@@ -122,6 +125,22 @@ if (!((& $clang --version) -match '^clang version 20\.1\.0(?: |$)')) {
 }
 Get-Command python, git -ErrorAction Stop | Out-Null
 if (!$Offline) { Invoke-Checked git @('lfs','version') }
+
+if ($OptixDir) {
+    $optix = Get-ProjectPath $OptixDir $null
+} else {
+    $optix = Join-Path $work 'optix-dev'
+    if (!(Test-Path -LiteralPath (Join-Path $optix '.git'))) {
+        if ($Offline) { throw "Provide OptiX 8.0.0 headers with -OptixDir or fetch them before using -Offline." }
+        Invoke-Checked git ($gitOpts + @('clone','--depth','1','--branch','v8.0.0','https://github.com/NVIDIA/optix-dev.git',$optix))
+    }
+    if ((git -C $optix rev-parse HEAD) -ne $optixCommit) { throw "Unexpected OptiX headers revision at $optix" }
+}
+$optixInclude = Join-Path $optix 'include'
+if (!(Select-String -LiteralPath (Join-Path $optixInclude 'optix.h') -Pattern '^#define OPTIX_VERSION\s+80000\s*$' -Quiet) -or
+    !(Select-String -LiteralPath (Join-Path $optixInclude 'optix_function_table.h') -Pattern '^#define OPTIX_ABI_VERSION\s+87\s*$' -Quiet)) {
+    throw 'This build uses the OptiX 8.0.0 headers (ABI 87).'
+}
 
 if (!(Test-Path -LiteralPath (Join-Path $source '.git'))) {
     if ($Offline) { throw "Missing source checkout for offline build: $source" }
@@ -160,9 +179,16 @@ $options = @('-S',$source,'-B',$build,'-G','Ninja','-C',$releasePreset,"-DCMAKE_
     '-DCMAKE_BUILD_TYPE=Release',"-DLIBDIR:PATH=$cmakeLibs","-DCMAKE_INSTALL_PREFIX=$install",
     "-DNINJA_MAX_NUM_PARALLEL_COMPILE_HEAVY_JOBS=$heavyJobs",'-DNINJA_MAX_NUM_PARALLEL_LINK_JOBS=1',
     '-DWITH_GTESTS=OFF','-DWITH_CYCLES_DEVICE_HIP=ON','-DWITH_CYCLES_DEVICE_HIPRT=OFF',
-    '-DWITH_CYCLES_HIP_BINARIES=OFF','-DWITH_CYCLES_DEVICE_CUDA=OFF','-DWITH_CYCLES_DEVICE_OPTIX=OFF',
+    '-DWITH_CYCLES_HIP_BINARIES=OFF','-DWITH_CYCLES_DEVICE_CUDA=ON','-DWITH_CYCLES_DEVICE_OPTIX=ON',
+    '-DWITH_CUDA_DYNLOAD=ON',"-DOPTIX_ROOT_DIR:PATH=$optix","-DOPTIX_INCLUDE_DIR:PATH=$optixInclude",
     '-DWITH_CYCLES_CUDA_BINARIES=OFF','-DWITH_CYCLES_ONEAPI_BINARIES=OFF','-DWITH_CYCLES_DEVICE_ONEAPI=OFF',
     '-DWITH_PYTHON_INSTALL=ON')
+if ($physicalProject -match '[^\x00-\x7F]') {
+    # Blender's generator resolves junctions when naming some generated objects.
+    # MSVC otherwise reads their UTF-8 names in Ninja response files as ANSI.
+    $options += "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES:FILEPATH=$(Join-Path $project 'engine/windows_link.cmake')"
+    $options += "-DCFP_PYTHON:FILEPATH=$((Get-Command python).Source)"
+}
 if ($Fresh) { $options += '--fresh' }
 Invoke-Checked $cm $options
 Invoke-Checked $cm @('--build',$build,'--target','install','--parallel',$Jobs)
@@ -170,9 +196,12 @@ Invoke-Checked $cm @('--build',$build,'--target','install','--parallel',$Jobs)
 $kernelDir = '5.2/scripts/addons_core/cycles/lib'
 $targetDir = Join-Path $install $kernelDir
 New-Item -Force -ItemType Directory $targetDir | Out-Null
-$kernels = @(Get-ChildItem -LiteralPath (Join-Path $BlenderInstall $kernelDir) -Filter 'kernel_gfx*.fatbin.zst')
-if (!$kernels) { throw "No HIP kernels found in $BlenderInstall." }
-foreach ($kernel in $kernels) { Copy-Item -LiteralPath $kernel.FullName -Destination $targetDir -Force }
+foreach ($pattern in 'kernel_gfx*.fatbin.zst','kernel_sm_*.cubin.zst','kernel_compute_*.ptx.zst','kernel_optix*.ptx.zst') {
+    $kernels = @(Get-ChildItem -LiteralPath (Join-Path $BlenderInstall $kernelDir) -Filter $pattern -File)
+    if (!$kernels) { throw "Missing official Blender 5.2.1 kernels matching $pattern in $BlenderInstall." }
+    foreach ($kernel in $kernels) { Copy-Item -LiteralPath $kernel.FullName -Destination $targetDir -Force }
+}
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'OptiX-NOTICE.md') -Destination (Join-Path $install 'license/others/NVIDIA-OptiX.md')
 Invoke-Checked (Join-Path $install 'blender.exe') @('-b','--factory-startup','--python-exit-code','1',
     '--python-expr','import _cycles; assert _cycles.with_exact_bvh and _cycles.with_native_frame_post and callable(_cycles.formal_begin)')
 Write-Output "Backend ready: $install\blender.exe"
