@@ -1,3 +1,4 @@
 run,launch_to_first_png_s,launch_to_last_png_s,launch_to_exit_s,warm_average_png_interval_s,warm_card_gpu_pct,warm_card_gpu_below_10_s,vram_before_gib,vram_peak_gib,ram_before_gib,ram_peak_gib,system_commit_before_gib,system_commit_peak_gib,main_private_commit_peak_gib
 official_blender,193.164,576.072,591.002,42.545,71.39,3.007,2.6509,8.5313,10.6859,31.9531,28.384,73.8934,41.5692
 cycles_frame_pipeline,200.398,472.271,488.001,30.208,91.52,10.267,2.711,8.4563,12.5071,31.953,30.4156,76.3124,41.1674
+eager,216.408,476.824,499.01,28.935,94.86,0.0,2.5331,12.3974,9.6671,31.9527,28.5733,87.4902,49.3311

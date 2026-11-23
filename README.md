@@ -8,16 +8,17 @@ The Windows engine includes AMD HIP, NVIDIA CUDA and NVIDIA OptiX. The published
 
 <!-- benchmark-projection:begin -->
 
-**Measured on a Radeon RX 7800 XT.** Using Host BVH Prepacking, Ruins frames 624–633 reached the final PNG **103.801 s sooner**. A 1,000-frame animation at the same steady output rate would save about **3 h 25 min 18 s**.
+**Measured on a Radeon RX 7800 XT.** From launch to the final PNG for Ruins frames 624–633, the default Host BVH Prepacking mode saved **103.801 s (18.02%)** against official Blender. Optional Eager GPU Upload saved **99.248 s (17.23%)**.
 
-| Sequence | Official Blender | v0.5.0 default | Time saved |
-|---|---:|---:|---:|
-| 10 frames · measured | 576.072 s | 472.271 s | **18.02%** |
-| 1,000 frames · projected | 11 h 51 min 36 s | 8 h 26 min 18 s | **28.85%** |
+| Mode | 10 frames measured | Reduction vs official | 1,000 frames projected | Reduction vs official |
+|---|---:|---:|---:|---:|
+| Official Blender | 576.072 s | Baseline | 11 h 51 min 36 s | Baseline |
+| **Host BVH Prepacking (default)** | **472.271 s** | **18.02%** | **8 h 26 min 18 s** | **28.85%** |
+| Eager GPU Upload (optional) | 476.824 s | 17.23% | 8 h 05 min 23 s | 31.79% |
 
-![Measured and projected reductions in time from launch to the final PNG](benchmarks/projection-en.png)
+![Measured and projected times for all three modes, with reductions relative to official Blender](benchmarks/projection-en.png)
 
-The estimate counts the first frame once and uses the mean of the nine subsequent PNG intervals for the remaining 999 frames. Both percentages use official Blender’s time at the same frame count as the denominator.
+The projection counts launch to the first PNG once, then applies each run’s mean of the next nine PNG intervals to the remaining 999 frames.
 
 <!-- benchmark-projection:end -->
 
@@ -94,22 +95,26 @@ Early packing requires a single background render tile. Per-batch pixel jitter, 
 
 ## Benchmark results
 
-On a Radeon RX 7800 XT, official Blender and the default v0.5.0 configuration each rendered Ruins frames 624–633 in order at 1920 × 1080 with HIP, persistent data and up to 256 adaptive samples at a 0.01 threshold.
+All three runs rendered Ruins frames 624–633 in order on one Radeon RX 7800 XT at 1920 × 1080, using HIP, persistent data and up to 256 adaptive samples at a 0.01 threshold.
 
-| Measurement | Official Blender | v0.5.0 default |
-|---|---:|---:|
-| Launch to first PNG | 193.164 s | 200.398 s |
-| Launch to final PNG | 576.072 s | **472.271 s** |
-| Mean interval between PNGs | 42.545 s | **30.208 s** |
-| Mean GPU utilization between first and last PNG | 71.39% | 91.52% |
-| Time below 10% GPU utilization in that window | 3.007 s | 10.267 s |
-| Peak dedicated VRAM | 8.53 GiB | 8.46 GiB |
-| Peak physical RAM in use | 31.95 GiB | 31.95 GiB |
-| Peak system commit | 73.89 GiB | 76.31 GiB |
+| Measurement | Official Blender | Host BVH Prepacking (default) | Eager GPU Upload (optional) |
+|---|---:|---:|---:|
+| Launch to first PNG | 193.164 s | 200.398 s | 216.408 s |
+| Launch to final PNG | 576.072 s | **472.271 s** | 476.824 s |
+| Mean interval between PNGs | 42.545 s | 30.208 s | 28.935 s |
+| Mean GPU utilization between first and final PNG | 71.39% | 91.52% | 94.86% |
+| Time below 10% GPU utilization in that window | 3.007 s | 10.267 s | 0.000 s |
+| Peak dedicated VRAM | 8.53 GiB | 8.46 GiB | 12.40 GiB |
+| Peak physical RAM in use | 31.95 GiB | 31.95 GiB | 31.95 GiB |
+| Peak system commit | 73.89 GiB | 76.31 GiB | 87.49 GiB |
 
-![Timing, GPU activity and memory for ten consecutive Ruins frames](benchmarks/overview-en.png)
+![Timing, GPU activity and memory for the three ten-frame runs](benchmarks/overview-en.png)
 
-At all nine handoffs, Cycles finished packing the next frame’s BVH in system memory while the GPU sampled the preceding frame. The median gap between GPU sampling windows was **1.472 s**. The complete report includes one-second traces, per-frame timestamps and the 1,000-frame calculation. [Measurements and method](benchmarks/README.md)
+The default mode finished packing the next frame’s BVH during the preceding frame’s sampling window at all nine handoffs. The median gap between adjacent GPU sampling windows was **1.472 s**. Eager GPU Upload used a second session and its median gap was **0.147 s**. The full report includes the three telemetry traces, per-frame timings and test conditions. [Measurements and method](benchmarks/README.md)
+
+### Historical image comparison · v0.4.0 Eager GPU Upload vs official Blender
+
+The pixel comparison decodes each prepared PNG and compares it with the official PNG for the same frame. Of 20,736,000 pixels, **5,343** differed in RGB, with a maximum absolute difference of **1/255** in every frame. All alpha values matched. The mean absolute difference over RGB channels was **0.00008644** on the 0–255 scale. [Historical benchmark](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.4.0/benchmarks/README.md)
 
 <!-- benchmark-measurements:end -->
 

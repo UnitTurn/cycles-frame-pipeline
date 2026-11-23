@@ -11,12 +11,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from matplotlib.patches import Patch
-from matplotlib.ticker import FixedLocator
 
 
 HERE = Path(__file__).resolve().parent
-RUNS = ("official_blender", "cycles_frame_pipeline")
-COLORS = ("#65778C", "#007D71")
+RUNS = ("official_blender", "cycles_frame_pipeline", "eager")
+COLORS = ("#65778C", "#007D71", "#A65116")
 INK, MUTED, GRID = "#132D3D", "#475F70", "#DDE5E9"
 METRICS = (
     ("launch_to_last_png_s", 600, (0, 200, 400, 600), "s"),
@@ -28,7 +27,7 @@ METRICS = (
 )
 TEXT = {
     "en": {
-        "names": ("Official Blender", "v0.5.0 · Host BVH Prepacking"),
+        "names": ("Official Blender", "Host BVH prepacking · default", "Eager GPU upload · optional"),
         "overview": "Ten consecutive animation frames",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   Frames 624–633",
         "metrics": ("Launch to final PNG", "Mean interval between PNGs", "Mean GPU utilization",
@@ -39,15 +38,15 @@ TEXT = {
         "trace_labels": ("GPU utilization", "Dedicated VRAM", "Physical RAM", "System commit"),
         "time": "Seconds since launch",
         "notes": "Each column shows one complete run. Dashed lines mark publication of the first and last PNG.",
-        "projection_title": "Time saved across two sequence lengths",
-        "projection_sub": "Launch to final PNG on the RX 7800 XT. Percentages use Official Blender's time at the same frame count.",
+        "projection_title": "Measured and estimated sequence time",
+        "projection_sub": "RX 7800 XT   /   Launch to final PNG   /   Time reductions relative to Official Blender at the same frame count",
         "projection_rows": ("10 frames · measured", "1,000 frames · estimated"),
-        "projection_cols": ("Sequence", "Official Blender", "v0.5.0 default", "Time reduction"),
-        "projection_saving": "Estimated saving over 1,000 frames",
+        "projection_cols": ("Render mode", "Total time", "Time reduction"),
+        "reference": "Reference",
         "projection_note": "One measured first frame + 999 intervals at the mean of the nine measured PNG intervals.",
     },
     "zh": {
-        "names": ("官方 Blender", "v0.5.0 · 主机端 BVH 预打包"),
+        "names": ("官方 Blender", "主机端 BVH 预打包 · 默认", "提前上传显存 · 可选"),
         "overview": "连续十帧动画渲染",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   第 624–633 帧",
         "metrics": ("启动至最后一张 PNG 写完", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
@@ -61,8 +60,8 @@ TEXT = {
         "projection_title": "10 帧实测与 1,000 帧估算的耗时降幅",
         "projection_sub": "RX 7800 XT 单次启动至末张 PNG 写完，耗时降幅以同帧数的官方 Blender 耗时为分母。",
         "projection_rows": ("10 帧 · 实测", "1,000 帧 · 估算"),
-        "projection_cols": ("渲染序列", "官方 Blender", "v0.5.0 默认设置", "耗时降幅"),
-        "projection_saving": "1,000 帧预计节省",
+        "projection_cols": ("渲染模式", "总耗时", "耗时降幅"),
+        "reference": "基准",
         "projection_note": "实测首帧耗时 + 999 个出图间隔，每个间隔取实测后九帧的平均值。",
     },
 }
@@ -129,45 +128,49 @@ def duration_label(seconds, language):
 
 def projection(language, rows):
     words = TEXT[language]
-    fig = plt.figure(figsize=(14, 5.6))
-    fig.text(.052, .935, words["projection_title"], va="top", fontsize=24,
+    fig = plt.figure(figsize=(14.5, 5.8))
+    fig.text(.04, .94, words["projection_title"], va="top", fontsize=24,
              fontweight="bold", color=INK)
-    fig.text(.053, .826, words["projection_sub"], va="top", fontsize=11.4, color=MUTED)
-    columns = (.053, .282, .462, .705)
-    for col, label in zip(columns, words["projection_cols"]):
-        fig.text(col, .677, label, fontsize=12, fontweight="bold", color=INK)
-    ax = fig.add_axes([columns[3], .293, .245, .338])
-    style_axis(ax)
-    ax.set_yticks([])
-    ax.set_ylim(1.5, -.5)
-    ax.set_xlim(0, 39)
-    ax.set_xticks((0, 10, 20, 30), ("0%", "10%", "20%", "30%"))
-    ax.grid(axis="x", color=GRID, linewidth=.8)
-    release = rows[1]
-    for index, prefix in enumerate(("measured", "projected")):
-        y = ax.get_position().y1 - ax.get_position().height * (index + .5) / 2
-        fig.text(columns[0], y, words["projection_rows"][index], va="center", color=INK,
-                 fontweight="bold", fontsize=13.2)
-        for column, run in zip(columns[1:3], rows):
+    fig.text(.041, .83, words["projection_sub"], va="top", fontsize=11, color=MUTED)
+    mode_label, time_label, reduction_label = words["projection_cols"]
+    fig.text(.041, .639, mode_label, fontsize=11, fontweight="bold", color=MUTED)
+    bottom, height = .215, .374
+    row_centers = [bottom + height * (1 - (i + .5) / len(rows)) for i in range(len(rows))]
+    for name, color, y in zip(words["names"], COLORS, row_centers):
+        fig.text(.041, y, name, va="center", color=color, fontsize=12.5, fontweight="bold")
+
+    groups = (("measured", .30, .423), ("projected", .642, .80))
+    for heading_text, (prefix, time_x, rate_x) in zip(words["projection_rows"], groups):
+        fig.text(time_x, .715, heading_text, color=INK, fontsize=15, fontweight="bold")
+        fig.text(time_x, .639, time_label, fontsize=11, fontweight="bold", color=MUTED)
+        fig.text(rate_x, .639, reduction_label, fontsize=11, fontweight="bold", color=MUTED)
+        ax = fig.add_axes([rate_x, bottom, .16, height])
+        style_axis(ax)
+        ax.set_yticks([])
+        ax.set_ylim(len(rows) - .5, -.5)
+        ax.set_xlim(0, 36)
+        ax.set_xticks((0, 10, 20, 30), ("0%", "10%", "20%", "30%"))
+        ax.grid(axis="x", color=GRID, linewidth=.8)
+        for index, (run, color, y) in enumerate(zip(rows, COLORS, row_centers)):
             total = run[f"{prefix}_total_s"]
-            duration = (f"{total:.3f} {'秒' if language == 'zh' else 's'}" if prefix == "measured"
-                        else duration_label(total, language))
-            fig.text(column, y, duration, va="center", color=INK, fontsize=13.2)
-        rate = release[f"{prefix}_reduction_vs_official_pct"]
-        ax.barh(index, float(rate), height=.43, color=COLORS[1])
-        ax.text(float(rate) + 1, index, f"{rate:.2f}%", va="center", color=INK,
-                fontweight="bold", fontsize=12.5)
-    saved = duration_label(release["projected_saved_vs_official_s"], language)
-    fig.text(.053, .158, f"{words['projection_saving']}    {saved}",
-             fontweight="bold", color=COLORS[1], fontsize=14.2)
-    fig.text(.053, .077, words["projection_note"], color=MUTED, fontsize=11)
+            duration = (f"{total:.3f} {'秒' if language == 'zh' else 's'}"
+                        if prefix == "measured" else duration_label(total, language))
+            fig.text(time_x, y, duration, va="center", color=INK, fontsize=12)
+            if index == 0:
+                ax.text(1, index, words["reference"], va="center", color=MUTED, fontsize=10)
+                continue
+            rate = float(run[f"{prefix}_reduction_vs_official_pct"])
+            ax.barh(index, rate, height=.35, color=color)
+            ax.text(rate - .9, index, f"{rate:.2f}%", ha="right", va="center",
+                    color="white", fontsize=10, fontweight="bold")
+    fig.text(.041, .067, words["projection_note"], color=MUTED, fontsize=11)
     fig.savefig(HERE / f"projection-{language}.png", dpi=150, facecolor="white")
     plt.close(fig)
 
 
 def overview(language, summary):
     words = TEXT[language]
-    fig, axes = plt.subplots(3, 2, figsize=(12.5, 8.5))
+    fig, axes = plt.subplots(3, 2, figsize=(13, 9.2))
     fig.subplots_adjust(left=.067, right=.96, bottom=.075, top=.748, wspace=.25, hspace=.92)
     heading(fig, words["overview"], words["subtitle"])
     handles = [Patch(facecolor=color, label=name) for name, color in zip(words["names"], COLORS)]
@@ -178,7 +181,7 @@ def overview(language, summary):
         ax.barh(range(len(RUNS)), values, color=COLORS, height=.46)
         ax.set_ylim(len(RUNS) - .4, -.6)
         ax.set_xlim(0, limit * 1.12)
-        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.set_xticks(ticks)
         ax.set_yticks([])
         style_axis(ax)
         ax.grid(axis="x", color=GRID, linewidth=.8)
@@ -186,8 +189,9 @@ def overview(language, summary):
                      fontweight="bold", pad=16)
         ax.text(0, 1.004, words["windows"][i], transform=ax.transAxes, va="bottom",
                 color=MUTED, fontsize=9.2)
+        precision = 3 if unit == "s" else 2
         for pos, value in enumerate(values):
-            ax.text(value + limit * .017, pos, f"{value:.2f}{'' if unit == '%' else ' '}{unit}",
+            ax.text(value + limit * .017, pos, f"{value:.{precision}f}{'' if unit == '%' else ' '}{unit}",
                     va="center", ha="left", fontsize=10.5, color=INK)
     fig.savefig(HERE / f"overview-{language}.png", dpi=150, facecolor="white")
     plt.close(fig)
@@ -195,11 +199,11 @@ def overview(language, summary):
 
 def telemetry(language, summary, rows):
     words = TEXT[language]
-    fig, axes = plt.subplots(4, len(RUNS), sharex=True, sharey="row", figsize=(13, 9))
+    fig, axes = plt.subplots(4, len(RUNS), sharex=True, sharey="row", figsize=(14.5, 9))
     fig.subplots_adjust(left=.083, right=.976, bottom=.13, top=.79, hspace=.35, wspace=.10)
     heading(fig, words["traces"], words["subtitle"])
     y_metrics = (("gpu_busy_pct", "%", (0, 50, 100)), ("vram_used_gib", "GiB", (0, 8, 16)),
-                 ("ram_used_gib", "GiB", (0, 16, 32)), ("commit_gib", "GiB", (0, 40, 80)))
+                 ("ram_used_gib", "GiB", (0, 16, 32)), ("commit_gib", "GiB", (0, 50, 100)))
     end = 150 * ceil(max(float(summary[run]["launch_to_exit_s"]) for run in RUNS) / 150)
     for column, run in enumerate(RUNS):
         series = [r for r in rows if r["run"] == run and
@@ -220,7 +224,7 @@ def telemetry(language, summary, rows):
             if column == 0:
                 ax.set_ylabel(f"{words['trace_labels'][index]}\n({unit})", color=INK, fontsize=10)
             if index == 0:
-                ax.set_title(words["names"][column], fontsize=16, fontweight="bold",
+                ax.set_title(words["names"][column], fontsize=13, fontweight="bold",
                              color=COLORS[column], loc="left", pad=11)
     fig.supxlabel(words["time"], y=.070, color=INK, fontsize=11)
     fig.text(.066, .025, words["notes"], fontsize=10, color=MUTED)
