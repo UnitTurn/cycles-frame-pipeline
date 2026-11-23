@@ -82,7 +82,7 @@ def instructions(version, language):
 
 启动器首次运行时复制现有 Blender 启动文件、偏好与默认用户扩展到 `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\zh_HANS`。以后的启动会继续使用这个中文配置。直接运行 `backend\\blender.exe` 使用常规 Blender 配置。从官方 Blender 提交作业时，可在插件偏好设置中将「定制 Blender 程序」指向新建的 `backend\\blender.exe`。
 
-[中文说明与构建步骤]({tag}/README.zh-CN.md) · [本版本完整工程源码及补丁]({tag}) · [对应 Blender 上游源码]({upstream})
+[本版本的文档入口（选择「中文指南」）]({release}) · [本版本完整工程源码及补丁]({tag}) · [对应 Blender 上游源码]({upstream})
 
 本包随附项目许可证 `COPYING`、官方 `copyright.txt` 以及 `license/` 中的第三方许可声明。
 """
@@ -100,7 +100,7 @@ The native pipeline defaults to Host BVH Prepacking. Use `--eager-upload` on the
 
 On first launch, the launcher copies your existing Blender startup file, preferences and default user extension repositories to `%LOCALAPPDATA%\\CyclesFramePipeline\\5.2\\en_US`. Future launches reuse this English profile. Starting `backend\\blender.exe` directly uses the regular Blender profile. To submit jobs from official Blender, point the extension's custom Blender executable preference to the new `backend\\blender.exe`.
 
-[English manual and build instructions]({tag}/README.md) · [Release project source and patches]({tag}) · [Corresponding upstream Blender source]({upstream})
+[Documentation for this release (choose English guide)]({release}) · [Release project source and patches]({tag}) · [Corresponding upstream Blender source]({upstream})
 
 License notices are included in `COPYING`, the official `copyright.txt` and `license/`.
 """

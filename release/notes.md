@@ -1,6 +1,6 @@
 # Cycles Frame Pipeline v0.5.0 — Host BVH Prepacking
 
-[简体中文发布说明](https://github.com/UnitTurn/cycles-frame-pipeline/blob/main/release/notes.zh-CN.md)
+[English guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md) · [中文指南](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.zh-CN.md) · [简体中文发布说明](https://github.com/UnitTurn/cycles-frame-pipeline/blob/main/release/notes.zh-CN.md)
 
 While the GPU samples one frame, Blender evaluates the next frame in animation order. For eligible HIP and CUDA scenes, Cycles validates and packs that frame’s software BVH2 on the CPU. Once the GPU releases the previous frame, Cycles uploads the prepared data and starts sampling. On the Ruins animation, all nine frame transitions used their prepared BVH exactly once. The median time between sampling frames was **1.47 seconds**.
 
@@ -30,15 +30,15 @@ The pixel comparison decodes each prepared PNG and compares it with the official
 
 ## Installation and use
 
-Install official Blender **5.2.1 LTS for Windows x64**, build `9e2066aef7ef`. Select the extension and Windows engine overlay in the same language. The overlay installer uses the runtime and GPU kernels from that Blender installation. [Installation guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.md#install)
+Install official Blender **5.2.1 LTS for Windows x64**, build `9e2066aef7ef`. Select the extension and Windows engine overlay in the same language. The overlay installer uses the runtime and GPU kernels from that Blender installation. [Installation guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#install)
 
 | Package | English | 简体中文 |
 |---|---|---|
 | Blender extension | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-en.zip) | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-zh-CN.zip) |
 | Windows x64 engine overlay | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-en.zip) | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-zh-CN.zip) |
 
-The native command-line mode uses host BVH prepacking by default on eligible scenes. Add `--eager-upload` to prepare the next frame in a second GPU session. In the panel, clear **Host BVH Prepacking** to select early upload. [Render instructions](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.md#render-an-animation) · [Project source ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-source-0.5.0.zip)
+The native command-line mode uses host BVH prepacking by default on eligible scenes. Add `--eager-upload` to prepare the next frame in a second GPU session. In the panel, clear **Host BVH Prepacking** to select early upload. [Render instructions](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#render-an-animation) · [Project source ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-source-0.5.0.zip)
 
 ## GPU coverage
 
-The AMD production benchmark above covers HIP with software BVH2. CUDA also supports the new software BVH2 path in the engine. OptiX uses NVIDIA’s native acceleration structures and builds them through the selected GPU session. Earlier RTX 3090 tests completed a three-frame animation on both CUDA and OptiX. Production timings for v0.5.0 on NVIDIA remain unmeasured. [GPU and Blender compatibility](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.0/README.md#gpu-and-blender-compatibility)
+The AMD production benchmark above covers HIP with software BVH2. CUDA also supports the new software BVH2 path in the engine. OptiX uses NVIDIA’s native acceleration structures and builds them through the selected GPU session. Earlier RTX 3090 tests completed a three-frame animation on both CUDA and OptiX. Production timings for v0.5.0 on NVIDIA remain unmeasured. [GPU and Blender compatibility](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#gpu-and-blender-compatibility)
