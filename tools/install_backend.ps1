@@ -7,17 +7,17 @@ Create a separate Cycles Frame Pipeline runtime from official Blender 5.2.1 for 
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$PatchedExe,
+    [string]$PatchedExe = (Join-Path $PSScriptRoot 'blender.exe'),
     [string]$BlenderInstall = "$env:ProgramFiles\Blender Foundation\Blender 5.2",
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [ValidateSet('en', 'zh-CN')][string]$Language = 'en'
 )
 $ErrorActionPreference = 'Stop'
-$messagesFile = Join-Path $PSScriptRoot 'install-messages.psd1'
-$launcher = Join-Path $PSScriptRoot 'open_blender.ps1'
+$templates = Join-Path $PSScriptRoot 'windows_release'
+$messagesFile = Join-Path $templates "$Language.psd1"
+$launcher = Join-Path $templates 'open_blender.ps1'
 $optixNotice = Join-Path $PSScriptRoot 'license\others\NVIDIA-OptiX.md'
-if (!(Test-Path -LiteralPath $messagesFile -PathType Leaf)) {
-    $messagesFile = Join-Path $PSScriptRoot 'windows_release\en.psd1'
-    $launcher = Join-Path $PSScriptRoot 'windows_release\open_blender.ps1'
+if (!(Test-Path -LiteralPath $optixNotice -PathType Leaf)) {
     $optixNotice = Join-Path (Split-Path -Parent $PSScriptRoot) 'engine\OptiX-NOTICE.md'
 }
 $messages = Import-PowerShellDataFile -LiteralPath $messagesFile
@@ -39,10 +39,19 @@ if ($LASTEXITCODE -ne 0 -or !($stockVersion -match '9e2066aef7ef')) {
     throw ($messages.Version -f $stock)
 }
 $kernels = Join-Path $stock '5.2\scripts\addons_core\cycles\lib'
-if (!(Get-ChildItem -LiteralPath $kernels -File | Where-Object {
-    $_.Name -like 'kernel_gfx*.fatbin.zst' -or $_.Name -like 'kernel_sm_*.cubin.zst' -or
-    $_.Name -like 'kernel_compute_*.ptx.zst' -or $_.Name -eq 'kernel_optix.ptx.zst'
-})) {
+$names = @(if (Test-Path -LiteralPath $kernels -PathType Container) {
+    Get-ChildItem -LiteralPath $kernels -File -Name
+})
+$backends = [ordered]@{
+    HIP = [bool]($names -like 'kernel_gfx*.fatbin.zst')
+    CUDA = ($names -like 'kernel_sm_*.cubin.zst') -or ($names -like 'kernel_compute_*.ptx.zst')
+    OptiX = $names -contains 'kernel_optix.ptx.zst'
+}
+foreach ($backend in $backends.Keys) {
+    if ($backends[$backend]) { Write-Output ($messages.KernelPresent -f $backend) }
+    else { Write-Warning ($messages.KernelMissing -f $backend, $kernels) }
+}
+if ($backends.Values -notcontains $true) {
     throw ($messages.Kernels -f $kernels)
 }
 $parentDir = Split-Path -Parent $target

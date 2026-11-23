@@ -11,6 +11,28 @@ import sys
 import tempfile
 
 
+def select_gpu(scene, device, device_name=None, *, prefer_reference_card=False):
+    import bpy
+
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    prefs.compute_device_type = device
+    if device == "HIP":
+        prefs.use_hiprt = False
+    cards = [card for card in prefs.get_devices_for_type(device) if card.type == device]
+    available = [f"{card.name} [{card.id}]" for card in cards]
+    if device_name:
+        cards = [card for card in cards if device_name == card.id or device_name.casefold() in card.name.casefold()]
+    elif prefer_reference_card and len(cards) > 1:
+        cards = [card for card in cards if "RX 7800 XT" in card.name]
+    if len(cards) != 1:
+        raise RuntimeError(f"Select one {device} GPU by name or ID. Available: {available}")
+    card = cards[0]
+    for entry in prefs.devices:
+        entry.use = entry.type == device and entry.id == card.id
+    scene.cycles.device = "GPU"
+    return {"type": device, "name": card.name, "id": card.id}
+
+
 def make_base_scene(device, hip_name, time_steps, motion_blur):
     import bpy
 
@@ -26,29 +48,11 @@ def make_base_scene(device, hip_name, time_steps, motion_blur):
     scene.cycles.debug_bvh_time_steps = time_steps
     scene.render.use_motion_blur = motion_blur
     if device == "HIP":
-        cycles_prefs = prefs.addons["cycles"].preferences
-        cycles_prefs.compute_device_type = "HIP"
-        cycles_prefs.use_hiprt = False
-        devices = cycles_prefs.get_devices_for_type("HIP")
-        cards = [card for card in devices if card.type == "HIP"]
-        if hip_name:
-            cards = [card for card in cards if hip_name.casefold() in card.name.casefold()
-                     or hip_name == card.id]
-        elif len(cards) > 1:
-            # This fixture targets the user's workstation. Avoid accidentally running multiple GPUs.
-            cards = [card for card in cards if "RX 7800 XT" in card.name]
-        if len(cards) != 1:
-            available = [f"{card.name} [{card.id}]" for card in devices if card.type == "HIP"]
-            raise RuntimeError(f"Select a single plain HIP device via --hip-name. Available: {available}")
-        gpu = cards[0]
-        for entry in cycles_prefs.devices:
-            entry.use = entry.type == "HIP" and entry.id == gpu.id
-        scene.cycles.device = "GPU"
-        device_id = gpu.id
+        selected = select_gpu(scene, device, hip_name, prefer_reference_card=True)
     else:
         scene.cycles.device = "CPU"
-        device_id = "CPU"
-    print("FRAMEPIPE_TEST_DEVICE=" + json.dumps({"type": device, "id": device_id}), flush=True)
+        selected = {"type": device, "id": "CPU"}
+    print("FRAMEPIPE_TEST_DEVICE=" + json.dumps(selected), flush=True)
     scene.cycles.samples = 4
     scene.cycles.use_denoising = False
     scene.cycles.use_adaptive_sampling = False

@@ -66,8 +66,8 @@ if args.extension_only:
 
 source_zip = dist / f"{metadata['id']}-source-{metadata['version']}.zip"
 with zipfile.ZipFile(source_zip.with_suffix(".tmp"), "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ("README.md", "README.zh-CN.md", "COPYING", ".gitattributes", ".gitignore",
-                 ".github/workflows/release.yml"):
+    for name in ("README.md", "README.zh-CN.md", "COPYING", "LICENSES/Apache-2.0.txt",
+                 ".gitattributes", ".gitignore", ".github/workflows/release.yml", ".github/workflows/check.yml"):
         archive.write(ROOT / name, name)
     # Keep locally built binaries, input scenes, raw telemetry and user data out of releases.
     public_sources = {

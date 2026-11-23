@@ -2,27 +2,15 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Cycles Frame Pipeline 0.5.0 uses **Host BVH Prepacking** by default. On supported software BVH2 scenes, Blender evaluates frame **N+1** while the GPU samples frame **N**. Cycles validates the next frame’s geometry inputs, packs its BVH on the CPU and keeps the result in system memory. At handoff, the same Cycles session uploads the prepared data and starts sampling. A CPU worker processes the previous frame and writes its PNG.
+Cycles Frame Pipeline uses **Host BVH Prepacking** by default. On supported software BVH2 scenes, Blender evaluates frame **N+1** while the GPU samples frame **N**. Cycles validates the next frame’s geometry inputs, packs its BVH on the CPU and keeps the result in system memory. At handoff, the same Cycles session uploads the prepared data and starts sampling. A CPU worker processes the previous frame and writes its PNG.
 
 The Windows engine includes AMD HIP, NVIDIA CUDA and NVIDIA OptiX. The published Host BVH Prepacking benchmark uses an RX 7800 XT with HIP. [GPU and Blender compatibility](#gpu-and-blender-compatibility) · [Ruins benchmark](benchmarks/README.md)
 
-<!-- benchmark-projection:begin -->
+<a id="benchmark-results"></a><a id="benchmark-and-image-quality"></a>
 
-**Measured on a Radeon RX 7800 XT.** From launch to the final PNG for Ruins frames 624–633, the default Host BVH Prepacking mode saved **103.801 s (18.02%)** against official Blender. Optional Eager GPU Upload saved **99.248 s (17.23%)**.
+**Ruins, Radeon RX 7800 XT.** From the first completed PNG (frame 624) to the tenth (frame 633), the next nine frames took 382.908 s in official Blender, 271.873 s with Host BVH Prepacking (**29.00% less time**) and 260.416 s with Eager GPU Upload (**31.99% less time**). Startup and the first frame are reported separately. [Timings, hardware, estimates and image comparisons](benchmarks/README.md)
 
-| Mode | 10 frames measured | Reduction vs official | 1,000 frames projected | Reduction vs official |
-|---|---:|---:|---:|---:|
-| Official Blender | 576.072 s | Baseline | 11 h 51 min 36 s | Baseline |
-| **Host BVH Prepacking (default)** | **472.271 s** | **18.02%** | **8 h 26 min 18 s** | **28.85%** |
-| Eager GPU Upload (optional) | 476.824 s | 17.23% | 8 h 05 min 23 s | 31.79% |
-
-![Measured and projected times for all three modes, with reductions relative to official Blender](benchmarks/projection-en.png)
-
-The projection counts launch to the first PNG once, then applies each run’s mean of the next nine PNG intervals to the remaining 999 frames.
-
-<!-- benchmark-projection:end -->
-
-[Install](#install) · [Render an animation](#render-an-animation) · [Benchmark results](#benchmark-results) · [Build and test](#build-and-test)
+[Install](#install) · [Render an animation](#render-an-animation) · [Build and test](#build-and-test)
 
 ## When to use it
 
@@ -45,26 +33,16 @@ HIP and CUDA use native software BVH2 validation and packing when the scene qual
 
 ## Install
 
-1. Install the official **Blender 5.2.1 LTS Windows x64** build. The installer checks the build hash because the patched executable uses the matching Blender runtime and HIP, CUDA and OptiX kernels.
-2. For the English interface, download `cycles-frame-pipeline-windows-x64-0.5.0-en.zip` (Windows engine overlay and English installer) and `cycles_frame_pipeline-0.5.0-en.zip` (extension) from the [latest release](https://github.com/UnitTurn/cycles-frame-pipeline/releases/latest). The Chinese distribution has the same extension ID and engine. Install one language edition. Extract the engine overlay to `.\downloads\engine` for the paths below. From your working directory, run the included English installer in PowerShell. Adjust the official installation path and choose a new destination directory for the side-by-side runtime.
+1. Install [official Blender 5.2.1 LTS for Windows x64](https://download.blender.org/release/Blender5.2/). The overlay uses the runtime and device kernels from build `9e2066aef7ef`.
+2. Download the [shared Windows engine](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles-frame-pipeline-windows-x64-0.5.1.zip) and the [English extension](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles_frame_pipeline-0.5.1-en.zip). Extract the engine into `.\downloads\engine`. From your working directory run:
 
    ```powershell
-   .\downloads\engine\install_backend.ps1 `
-       -PatchedExe '.\downloads\engine\blender.exe' `
-       -BlenderInstall 'C:\Program Files\Blender Foundation\Blender 5.2' `
-       -Destination '.\backend'
-   ```
-
-3. Open the English Blender window using the launcher installed with the backend.
-
-   ```powershell
+   .\downloads\engine\install_backend.ps1 -Language en -Destination .\backend
    .\backend\open_blender.ps1
    ```
 
-4. **In that window**, open **Edit → Preferences → Get Extensions → menu → Install from Disk**, select `cycles_frame_pipeline-0.5.0-en.zip` and choose the default user repository. Enable **Cycles Frame Pipeline**. Use the same launcher next time. It keeps this edition's preferences and default extensions under `%LOCALAPPDATA%\CyclesFramePipeline\5.2\en_US`. On first launch, it imports the existing startup settings and default user extensions.
-
-**Using your regular Blender profile.** Starting `backend\blender.exe` directly follows your normal Blender language and preferences. To submit from an official Blender installation, install the English extension in that window and set **Custom Blender Executable** to the patched `backend\blender.exe`. The CLI workflow below uses the repository scripts and the backend.
-
+   Choose a new destination. If Blender is outside its usual Program Files directory, also pass `-BlenderInstall 'C:\path\to\Blender 5.2'`. The installer reports HIP, CUDA and OptiX kernel files separately. The same engine ZIP accepts `-Language zh-CN` for a Chinese profile.
+3. In the opened Blender window, choose **Edit → Preferences → Get Extensions → menu → Install from Disk** and enable the extension ZIP in the default user repository. The launcher keeps English settings under `%LOCALAPPDATA%\CyclesFramePipeline\5.2\en_US` and imports existing startup settings and default user extensions on first use. To submit from official Blender, install the extension there and set **Custom Blender Executable** to the new `backend\blender.exe`. Starting that executable directly uses your regular Blender profile.
 
 ## Render an animation
 
@@ -89,36 +67,6 @@ HIP and CUDA use native software BVH2 validation and packing when the scene qual
 
 Early packing requires a single background render tile. Per-batch pixel jitter, textures with on-demand tile loading, and geometry that needs GPU displacement use the corresponding native update at handoff. The log records `host_bvh_ready` when the packed data is ready in system memory and `bvh_pack_consumed` when the next frame consumes it. OptiX uses its backend-specific acceleration structures.
 
-<!-- benchmark-measurements:begin -->
-
-<a id="benchmark-and-image-quality"></a>
-
-## Benchmark results
-
-All three runs rendered Ruins frames 624–633 in order on one Radeon RX 7800 XT at 1920 × 1080, using HIP, persistent data and up to 256 adaptive samples at a 0.01 threshold.
-
-| Measurement | Official Blender | Host BVH Prepacking (default) | Eager GPU Upload (optional) |
-|---|---:|---:|---:|
-| Launch to first PNG | 193.164 s | 200.398 s | 216.408 s |
-| Launch to final PNG | 576.072 s | **472.271 s** | 476.824 s |
-| Mean interval between PNGs | 42.545 s | 30.208 s | 28.935 s |
-| Mean GPU utilization between first and final PNG | 71.39% | 91.52% | 94.86% |
-| Time below 10% GPU utilization in that window | 3.007 s | 10.267 s | 0.000 s |
-| Peak dedicated VRAM | 8.53 GiB | 8.46 GiB | 12.40 GiB |
-| Peak physical RAM in use | 31.95 GiB | 31.95 GiB | 31.95 GiB |
-| Peak system commit | 73.89 GiB | 76.31 GiB | 87.49 GiB |
-
-![Timing, GPU activity and memory for the three ten-frame runs](benchmarks/overview-en.png)
-
-The default mode finished packing the next frame’s BVH during the preceding frame’s sampling window at all nine handoffs. The median gap between adjacent GPU sampling windows was **1.472 s**. Eager GPU Upload used a second session and its median gap was **0.147 s**. The full report includes the three telemetry traces, per-frame timings and test conditions. [Measurements and method](benchmarks/README.md)
-
-### Historical image comparison · v0.4.0 Eager GPU Upload vs official Blender
-
-The pixel comparison decodes each prepared PNG and compares it with the official PNG for the same frame. Of 20,736,000 pixels, **5,343** differed in RGB, with a maximum absolute difference of **1/255** in every frame. All alpha values matched. The mean absolute difference over RGB channels was **0.00008644** on the 0–255 scale. [Historical benchmark](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.4.0/benchmarks/README.md)
-
-<!-- benchmark-measurements:end -->
-
-**NVIDIA CUDA and OptiX.** Earlier RTX 3090 tests completed a three-frame animation on both backends. The benchmark for the new default uses the RX 7800 XT.
 
 ## Build and test
 
@@ -132,15 +80,8 @@ python tools/package.py
 
 The language-specific extension ZIPs and shared source ZIP are written to `dist/`. Without `-InstallDir`, the backend installs to `work/clang-release/`. Once the source and dependencies have been fetched, `-Offline` reuses the local checkouts. [Build script](engine/build_backend.ps1) · [Cycles patch series](engine/patches)
 
-On an RX 7800 XT, the following test generates a small animated scene with a camera-dependent world shader, renders three frames with both engines and compares the decoded RGBA pixels. Use a new output directory.
-
-```powershell
-python -m pip install numpy pillow
-python engine/lookahead/check_stock_pipeline.py `
-    'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' `
-    .\backend\blender.exe .\parity-check --prepared
-```
+Pull requests package both extensions and exercise their panels in official Blender. For a local GPU check, compare the supplied animated scene on HIP, CUDA or OptiX. The fixture and both test commands are documented in [Frame handoff tests](engine/lookahead/README.md). Results on the release engine include timings and decoded PNG differences. [Public fixture results](benchmarks/README.md#public-fixture)
 
 ## License
 
-The project is distributed under **GPL-3.0-or-later**. Upstream Blender and Cycles files retain their license notices. [License text](COPYING)
+The project is licensed under [GPL-3.0-or-later](COPYING). Cycles files and test code marked `SPDX-License-Identifier: Apache-2.0` carry the [Apache 2.0 license](LICENSES/Apache-2.0.txt). Upstream notices accompany their files. [OptiX notices](engine/OptiX-NOTICE.md)

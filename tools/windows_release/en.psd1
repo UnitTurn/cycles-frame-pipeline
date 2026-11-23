@@ -5,6 +5,8 @@
     Destination = 'Choose a new directory outside the official Blender installation: {0}'
     Version = 'Select the official Blender 5.2.1 Windows x64 runtime (build 9e2066aef7ef): {0}'
     Kernels = 'Could not find any official HIP, CUDA or OptiX device kernels in {0}.'
+    KernelPresent = '{0} kernel files found.'
+    KernelMissing = '{0} kernel files are missing from {1}. Restore them from official Blender to use this backend.'
     Load = 'The patched engine could not load its matching runtime.'
     Location = 'Unexpected installation directory.'
     Installed = 'Installed {0}'

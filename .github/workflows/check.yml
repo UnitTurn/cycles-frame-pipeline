@@ -1,0 +1,40 @@
+name: Check extension
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Package both extensions and the source archive
+        run: python tools/package.py
+      - name: Cache the official Blender archive
+        id: blender
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ${{ runner.temp }}/blender-5.2.1-windows-x64.zip
+          key: official-blender-5.2.1-win-x64-0e631dad
+      - name: Download official Blender 5.2.1
+        if: steps.blender.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'blender-5.2.1-windows-x64.zip'
+          curl.exe --fail --location --retry 3 --output $archive 'https://download.blender.org/release/Blender5.2/blender-5.2.1-windows-x64.zip'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne '0e631dad7d0cad6d5d18abdd2e2550f6c0213215334eda00ddbd3d22b96ecb2c') { throw 'Blender archive digest mismatch' }
+      - name: Install both extensions and exercise the Blender panel
+        shell: pwsh
+        run: |
+          tar.exe -xf (Join-Path $env:RUNNER_TEMP 'blender-5.2.1-windows-x64.zip') -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/check_extension_ui.py (Join-Path $env:RUNNER_TEMP 'blender-5.2.1-windows-x64/blender.exe')

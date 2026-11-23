@@ -2,10 +2,16 @@
 
 [English](README.md)
 
-1. 构建并测试引擎，设置扩展清单版本，分别更新[中文](notes.zh-CN.md)和[英文](notes.md)发布说明。
-2. 使用 `tools/package_windows_backend.py` 分别为 `zh-CN` 和 `en` 生成 Windows 引擎 ZIP，将两套引擎与各自语言的插件配套安装并验证。
-3. 在仓库根目录运行 `python tools/stage_windows_release.py`，按输出的 Git 命令将两份已验证的包推送到临时分支 `release-input/v<版本号>`。
-4. 将 `release/windows-overlay.sha256` 与对应源码一起提交并推送至 `main`。给该提交打上 `v<版本号>` 标签并推送。工作流会核验两份引擎包，生成两个插件包和一个通用源码包，并发布全部五项。
-5. 确认资产均可下载后即可删除临时分支，版本标签保留构建说明和摘要。
+1. 设置扩展清单版本，更新[英文](notes.md)和[中文](notes.zh-CN.md)发行说明，以及对应版本的下载链接。
+2. 在仓库根目录打包扩展和通用 Windows 引擎，传入已测试的定制程序及匹配的官方 Blender 安装。
 
-修正输入后可以重新运行该标签的发布任务，也可以将 `main` 推送到 `refs/heads/publish/v<版本号>` 触发重试。任务从版本标签读取源码。
+   ```powershell
+   python tools/package.py
+   python tools/package_windows_backend.py .\backend\blender.exe "$env:ProgramFiles\Blender Foundation\Blender 5.2"
+   ```
+
+3. 验证打包后的引擎安装器和两种语言的扩展。运行 `python tools/stage_windows_release.py` 并执行其输出的 Git 推送命令，将引擎包暂存在 `release-input/v<版本>` 分支，摘要写入 `release/windows-overlay.sha256`。
+4. 将校验摘要、代码和文档一起提交到 `main` 并推送，等待 **Check extension** 通过。给已验证提交打 `v<版本>` 标签并推送标签。
+5. **Publish release** 核对暂存的引擎包，从标签构建两个扩展和一份源码包，发布四个资产。GitHub 确认四个文件已上传，且线上引擎摘要与标签记录一致后，工作流会删除本次实际使用的临时分支版本。
+
+上传失败时临时分支会保留。可重跑相同标签的工作流，或把源码提交推送到 `refs/heads/publish/v<版本>`。重试会继续完成已有草稿，或在确认版本已经发布后重试清理分支。

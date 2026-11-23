@@ -1,44 +1,29 @@
-# Cycles Frame Pipeline v0.5.0 — Host BVH Prepacking
+# Cycles Frame Pipeline v0.5.1 — Bilingual Windows engine
 
-[English guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md) · [中文指南](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.zh-CN.md) · [简体中文发布说明](https://github.com/UnitTurn/cycles-frame-pipeline/blob/main/release/notes.zh-CN.md)
+[English installation guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.1/README.md#install) · [中文安装指南](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.1/README.zh-CN.md#安装) · [简体中文发行说明](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.1/release/notes.zh-CN.md)
 
-While the GPU samples one frame, Blender evaluates the next frame in animation order. For eligible HIP and CUDA scenes, Cycles validates and packs that frame’s software BVH2 on the CPU. Once the GPU releases the previous frame, Cycles uploads the prepared data and starts sampling. On the Ruins animation, all nine frame transitions used their prepared BVH exactly once. The median time between sampling frames was **1.47 seconds**.
+Download one Windows engine and one extension. Run the installer with `-Language en` or `-Language zh-CN` to use the corresponding settings and extension profile. It lists the HIP, CUDA and OptiX kernel files it finds in official Blender 5.2.1 LTS for Windows x64 (build `9e2066aef7ef`).
 
-## Performance on the Radeon RX 7800 XT
+| Download | Package |
+|---|---|
+| Shared Windows x64 engine | [Engine ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles-frame-pipeline-windows-x64-0.5.1.zip) |
+| Blender extension | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles_frame_pipeline-0.5.1-en.zip) · [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles_frame_pipeline-0.5.1-zh-CN.zip) |
+| Corresponding project source and patches | [Source ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles_frame_pipeline-source-0.5.1.zip) |
 
-Three runs rendered Ruins frames 624–633 in order at 1920 × 1080 on one RX 7800 XT with HIP, persistent data, up to 256 adaptive samples and a 0.01 threshold. Each configuration ran once. Both modes use official Blender as the baseline at each frame count.
+## Ruins performance after the first frame
 
-| Metric | Official Blender 5.2.1 LTS | Host BVH Prepacking (default) | Eager GPU Upload (optional) |
+On an RX 7800 XT at 1080p using HIP, timing starts when frame **624** finishes writing its PNG and ends when frame **633** finishes. The denominator is official Blender's **382.908 s** for those same nine frames.
+
+| Mode | Frames 625–633 | Time saved | Measured time reduction |
 |---|---:|---:|---:|
-| Launch to first PNG | 193.164 s | 200.398 s | 216.408 s |
-| Launch to tenth PNG | 576.072 s | **472.271 s** | 476.824 s |
-| Measured reduction for ten frames | Baseline | **18.02%** | 17.23% |
-| Mean interval between PNGs after the first | 42.545 s | 30.208 s | 28.935 s |
-| Mean whole-GPU utilization over those nine intervals | 71.39% | 91.52% | 94.86% |
-| Peak dedicated GPU memory, whole card | 8.53 GiB | 8.46 GiB | 12.40 GiB |
-| Peak Windows committed memory, whole system | 73.89 GiB | 76.31 GiB | 87.49 GiB |
-| Projected time to the 1,000th PNG | 11 h 51 min 36 s | **8 h 26 min 18 s** | 8 h 05 min 23 s |
-| Projected reduction for 1,000 frames | Baseline | **28.85%** | 31.79% |
+| Official Blender | 382.908 s | — | Baseline |
+| Host BVH Prepacking (default) | 271.873 s | 111.035 s | **29.00%** |
+| Eager GPU Upload | 260.416 s | 122.492 s | **31.99%** |
 
-The projection counts launch to the first PNG once, then uses each run’s mean of the nine measured intervals for the remaining 999 frames. The default mode was timed on the prepacking release candidate. Eager upload uses the earlier run with the same settings. The packaged engine also checks for changes to UV and motion passes and handles a switch to serial output. Ruins kept the same passes and preparation mode throughout. [Benchmark report, frame timings and GPU and memory traces](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/benchmarks/README.md)
+Launch to first PNG took 193.164 s, 200.398 s and 216.408 s respectively. v0.5.1 carries the v0.5.0 native engine. These results use the existing Ruins measurements, one run per configuration, with the first frame excluded from both percentages. [Data, methods and estimates](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.1/benchmarks/README.md)
 
-![Measured and projected sequence time for official Blender and both upload modes](https://raw.githubusercontent.com/UnitTurn/cycles-frame-pipeline/9071b69024e589cd39025e2c9da8515bbaacb8d9/benchmarks/projection-en.png)
+## Public fixture and quality
 
-### Historical image comparison · v0.4.0 Eager GPU Upload vs official Blender
+The v0.5.1 Windows package passed the original three-frame RGBA comparison on HIP. On the longer 144 × 96 fixture, all nine BVH handoffs were observed. One blue channel in frame 9 differed from stock by 1/255. The other 138,239 pixels and all alpha values matched. The small fixture took **0.979415 s** in stock Blender and **1.440376 s** with prepacking over its final nine frames (**47.06% more time**). The public test supports HIP, CUDA and OptiX device selection. The data here was measured on the RX 7800 XT. [Commands and measurements](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.5.1/benchmarks/README.md#public-fixture)
 
-The pixel comparison decodes each prepared PNG and compares it with the official PNG for the same frame. Of 20,736,000 pixels, **5,343** differed in RGB, with a maximum absolute difference of **1/255** in every frame. All alpha values matched. The mean absolute difference over RGB channels was **0.00008644** on the 0–255 scale. [Historical benchmark](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.4.0/benchmarks/README.md)
-
-## Installation and use
-
-Install official Blender **5.2.1 LTS for Windows x64**, build `9e2066aef7ef`. Select the extension and Windows engine overlay in the same language. The overlay installer uses the runtime and GPU kernels from that Blender installation. [Installation guide](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#install)
-
-| Package | English | 简体中文 |
-|---|---|---|
-| Blender extension | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-en.zip) | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-0.5.0-zh-CN.zip) |
-| Windows x64 engine overlay | [English ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-en.zip) | [中文 ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles-frame-pipeline-windows-x64-0.5.0-zh-CN.zip) |
-
-The native command-line mode uses host BVH prepacking by default on eligible scenes. Add `--eager-upload` to prepare the next frame in a second GPU session. In the panel, clear **Host BVH Prepacking** to select early upload. [Render instructions](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#render-an-animation) · [Project source ZIP](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.0/cycles_frame_pipeline-source-0.5.0.zip)
-
-## GPU coverage
-
-The AMD production benchmark above covers HIP with software BVH2. CUDA also supports the new software BVH2 path in the engine. OptiX uses NVIDIA’s native acceleration structures and builds them through the selected GPU session. Earlier RTX 3090 tests completed a three-frame animation on both CUDA and OptiX. Production timings for v0.5.0 on NVIDIA remain unmeasured. [GPU and Blender compatibility](https://github.com/UnitTurn/cycles-frame-pipeline/blob/9071b69024e589cd39025e2c9da8515bbaacb8d9/README.md#gpu-and-blender-compatibility)
+Pull requests now build both extensions and exercise their UI in official Blender. Source archives include the Apache 2.0 text alongside the project GPL license.

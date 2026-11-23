@@ -2,27 +2,15 @@
 
 [English](README.md) · 简体中文
 
-Cycles 帧间流水线 0.5.0 默认使用**主机端 BVH 预打包**。对支持的软件 BVH2 场景，GPU 采样第 **N** 帧时，Blender 按原帧序求值第 **N+1** 帧，Cycles 在 CPU 上正式校验几何输入、完成 BVH 打包，将结果留在系统内存。切帧时，同一个 Cycles 会话直接取包上传并开始采样。前一帧的处理与 PNG 输出由后台 CPU 进程完成。
+Cycles 帧间流水线默认使用**主机端 BVH 预打包**。对支持的软件 BVH2 场景，GPU 采样第 **N** 帧时，Blender 按原帧序求值第 **N+1** 帧，Cycles 在 CPU 上正式校验几何输入、完成 BVH 打包，将结果留在系统内存。切帧时，同一个 Cycles 会话直接取包上传并开始采样。前一帧的处理与 PNG 输出由后台 CPU 进程完成。
 
 Windows 引擎包含 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。本页的主机端 BVH 预打包基准来自 RX 7800 XT 的 HIP 实测。[显卡与 Blender 兼容范围](#显卡与-blender-兼容范围) · [Ruins 基准](benchmarks/README.zh-CN.md)
 
-<!-- benchmark-projection:begin -->
+<a id="渲染性能基准"></a><a id="实测与成片对照"></a>
 
-**Radeon RX 7800 XT 实测。** 从启动到 Ruins 第 624–633 帧的最后一张 PNG 写完，默认主机端 BVH 预打包比官方 Blender 节省 **103.801 秒（18.02%）**。可选的提前上传模式节省 **99.248 秒（17.23%）**。
+**Ruins 动画，Radeon RX 7800 XT。** 从第 624 帧 PNG 写完计时，到第 633 帧 PNG 写完，官方 Blender 渲染后九帧用时 382.908 秒，主机端 BVH 预打包用时 271.873 秒（**耗时降低 29.00%**），提前上传用时 260.416 秒（**降低 31.99%**）。启动与首帧耗时单列。[逐帧数据、硬件、估算与画质对照](benchmarks/README.zh-CN.md)
 
-| 模式 | 10 帧实测 | 相对官方耗时降幅 | 1,000 帧估算 | 相对官方耗时降幅 |
-|---|---:|---:|---:|---:|
-| 官方 Blender | 576.072 秒 | 基准 | 11 小时 51 分 36 秒 | 基准 |
-| **主机端 BVH 预打包（默认）** | **472.271 秒** | **18.02%** | **8 小时 26 分 18 秒** | **28.85%** |
-| 提前上传（可选） | 476.824 秒 | 17.23% | 8 小时 05 分 23 秒 | 31.79% |
-
-![三种模式的十帧实测、千帧估算及相对官方的耗时降幅](benchmarks/projection-zh.png)
-
-估算计入一次启动到首张 PNG 的实测耗时，其余 999 帧沿用各自后九个出图间隔的均值。
-
-<!-- benchmark-projection:end -->
-
-[安装](#安装) · [渲染动画](#渲染动画) · [渲染性能基准](#渲染性能基准) · [从源码构建并验证](#从源码构建并验证)
+[安装](#安装) · [渲染动画](#渲染动画) · [从源码构建并验证](#从源码构建并验证)
 
 ## 适用场景
 
@@ -45,26 +33,16 @@ Windows 引擎包含 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。本页的主机端
 
 ## 安装
 
-1. 安装官方 **Blender 5.2.1 LTS Windows x64**。配套程序使用同一版本的 Blender 运行库以及 HIP、CUDA 和 OptiX 内核，安装脚本会检查官方构建的提交号。
-2. 从[最新发行版](https://github.com/UnitTurn/cycles-frame-pipeline/releases/latest)下载简体中文版的 Windows 引擎覆盖包 `cycles-frame-pipeline-windows-x64-0.5.0-zh-CN.zip`（含中文安装程序）和扩展 `cycles_frame_pipeline-0.5.0-zh-CN.zip`。两种语言的扩展使用相同的扩展 ID 和引擎，选择其中一种安装。按下例将引擎覆盖包解压到 `.\downloads\engine`，从工作目录打开 PowerShell，运行包内的中文安装脚本。按实际情况填写官方 Blender 安装位置，并为配套引擎选择一个尚不存在的目标目录。
+1. 安装[官方 Blender 5.2.1 LTS Windows x64 版](https://download.blender.org/release/Blender5.2/)。配套引擎使用构建 `9e2066aef7ef` 的运行库和 GPU 内核。
+2. 下载[通用 Windows 引擎包](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles-frame-pipeline-windows-x64-0.5.1.zip)和[中文扩展](https://github.com/UnitTurn/cycles-frame-pipeline/releases/download/v0.5.1/cycles_frame_pipeline-0.5.1-zh-CN.zip)。将引擎解压到 `.\downloads\engine`，从工作目录运行以下命令。
 
    ```powershell
-   .\downloads\engine\install_backend.ps1 `
-       -PatchedExe '.\downloads\engine\blender.exe' `
-       -BlenderInstall 'C:\Program Files\Blender Foundation\Blender 5.2' `
-       -Destination '.\backend'
-   ```
-
-3. 运行安装到引擎目录的启动脚本，打开简体中文 Blender 窗口。
-
-   ```powershell
+   .\downloads\engine\install_backend.ps1 -Language zh-CN -Destination .\backend
    .\backend\open_blender.ps1
    ```
 
-4. **在刚打开的窗口中**进入「编辑 → 偏好设置 → 获取扩展」，打开菜单，选择「从磁盘安装」。选中 `cycles_frame_pipeline-0.5.0-zh-CN.zip`，使用默认用户扩展仓库，启用 **Cycles 帧间流水线**。下次使用同一脚本启动。简体中文版的偏好设置和默认扩展保存在 `%LOCALAPPDATA%\CyclesFramePipeline\5.2\zh_HANS`。首次启动时会继承已有的启动配置和默认用户扩展。
-
-**使用平时的 Blender 配置。** 直接启动 `backend\blender.exe` 时，会沿用原有 Blender 语言与偏好设置。也可以在官方 Blender 窗口中安装简体中文扩展，将「定制 Blender 程序」指向配套的 `backend\blender.exe` 后提交渲染。下文命令行用法需要源码中的脚本和配套引擎。
-
+   目标须为新目录。官方 Blender 位于其他位置时，再传入 `-BlenderInstall 'C:\路径\Blender 5.2'`。安装器会分别报告是否找到 HIP、CUDA 和 OptiX 内核文件。使用同一引擎包传入 `-Language en` 可创建英文配置。
+3. 在刚打开的 Blender 窗口选择「编辑 → 偏好设置 → 获取扩展 → 菜单 → 从磁盘安装」，选择中文扩展 ZIP，在默认用户仓库中启用。启动器将中文配置放在 `%LOCALAPPDATA%\CyclesFramePipeline\5.2\zh_HANS`，首次运行会导入现有启动设置和默认用户扩展。若从官方 Blender 提交任务，可在那里安装扩展，将「定制 Blender 程序」指向新的 `backend\blender.exe`。直接打开这个程序会使用常规 Blender 配置。
 
 ## 渲染动画
 
@@ -89,36 +67,6 @@ Windows 引擎包含 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX。本页的主机端
 
 提前打包要求后台画面只有一个渲染块。启用逐批像素抖动、需要按需加载纹理瓦片，或几何需要 GPU 真置换时，引擎仍在切帧后完成相应更新。日志中的 `host_bvh_ready` 表示下一帧的包已在系统内存就绪，`bvh_pack_consumed` 表示切帧后已取用。OptiX 使用自己的加速结构构建路径。
 
-<!-- benchmark-measurements:begin -->
-
-<a id="实测与成片对照"></a>
-
-## 渲染性能基准
-
-三组均在一张 Radeon RX 7800 XT 上按原顺序渲染 Ruins 第 624–633 帧，使用 HIP、1920 × 1080、持久化数据，最多 256 个自适应采样，阈值为 0.01。
-
-| 指标 | 官方 Blender | 主机端 BVH 预打包（默认） | 提前上传（可选） |
-|---|---:|---:|---:|
-| 启动到首张 PNG 写完 | 193.164 秒 | 200.398 秒 | 216.408 秒 |
-| 启动到末张 PNG 写完 | 576.072 秒 | **472.271 秒** | 476.824 秒 |
-| 相邻 PNG 平均出图间隔 | 42.545 秒 | 30.208 秒 | 28.935 秒 |
-| 首张至末张 PNG 之间的平均 GPU 利用率 | 71.39% | 91.52% | 94.86% |
-| 同期 GPU 利用率低于 10% 的时长 | 3.007 秒 | 10.267 秒 | 0.000 秒 |
-| 专用显存峰值 | 8.53 GiB | 8.46 GiB | 12.40 GiB |
-| 整机物理内存使用峰值 | 31.95 GiB | 31.95 GiB | 31.95 GiB |
-| 系统提交内存峰值 | 73.89 GiB | 76.31 GiB | 87.49 GiB |
-
-![三种模式的十帧耗时、GPU 利用率和内存占用](benchmarks/overview-zh.png)
-
-默认模式的九次切帧都在前一帧采样期间打好了下一帧的 BVH 包，采样交接间隔中位数为 **1.472 秒**。提前上传使用第二个会话，中位数为 **0.147 秒**。完整报告含三组逐秒曲线、各帧时间戳和测试条件。[实测数据与方法](benchmarks/README.zh-CN.md)
-
-### 历史画面对照 · v0.4.0 提前上传与官方 Blender
-
-逐帧解码正式帧交接与官方的同帧 PNG。20,736,000 个像素中有 **5,343 个**的 RGB 存在差异，每一帧的最大通道差均为 **1/255**。全部 alpha 一致，按 0–255 计的 RGB 通道平均绝对差为 **0.00008644**。 [历史基准](https://github.com/UnitTurn/cycles-frame-pipeline/blob/v0.4.0/benchmarks/README.zh-CN.md)
-
-<!-- benchmark-measurements:end -->
-
-**NVIDIA CUDA 和 OptiX。** RTX 3090 的历史测试涵盖两种后端的三帧动画渲染。新默认模式的性能表仅使用 RX 7800 XT 的实测数据。
 
 ## 从源码构建并验证
 
@@ -132,15 +80,8 @@ python tools/package.py
 
 两个语言版本的插件 ZIP 和公共源码 ZIP 输出到 `dist/`。省略 `-InstallDir` 时，配套引擎默认安装到 `work/clang-release/`。源码与依赖已就绪后，使用 `-Offline` 可复用本地检出目录。[构建脚本](engine/build_backend.ps1) · [Cycles 补丁](engine/patches)
 
-在 RX 7800 XT 上，以下测试会生成一个世界材质读取相机坐标的小型动画场景，分别用官方和配套引擎渲染三帧，比较解码后的 RGBA 像素。请为本次测试指定新的输出目录。
-
-```powershell
-python -m pip install numpy pillow
-python engine/lookahead/check_stock_pipeline.py `
-    'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' `
-    .\backend\blender.exe .\parity-check --prepared
-```
+每个 PR 会打包两种语言的扩展，并用官方 Blender 检查其面板。公开动画样例可在 HIP、CUDA 或 OptiX 上与官方 Blender 对照。[切帧测试与运行命令](engine/lookahead/README.zh-CN.md) · [发行引擎的实测耗时和画质](benchmarks/README.zh-CN.md#公开样例)
 
 ## 许可证
 
-项目以 **GPL-3.0-or-later** 发布。上游 Blender 和 Cycles 文件保留各自的许可证声明。[许可证全文](COPYING)
+项目采用 [GPL-3.0-or-later](COPYING)。标注 `SPDX-License-Identifier: Apache-2.0` 的 Cycles 文件和测试代码采用 [Apache 2.0 许可证](LICENSES/Apache-2.0.txt)。上游文件保留各自的许可声明。[OptiX 声明](engine/OptiX-NOTICE.md)

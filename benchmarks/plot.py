@@ -18,7 +18,7 @@ RUNS = ("official_blender", "cycles_frame_pipeline", "eager")
 COLORS = ("#65778C", "#007D71", "#A65116")
 INK, MUTED, GRID = "#132D3D", "#475F70", "#DDE5E9"
 METRICS = (
-    ("launch_to_last_png_s", 600, (0, 200, 400, 600), "s"),
+    ("measured_nine_intervals_s", 400, (0, 100, 200, 300, 400), "s"),
     ("warm_average_png_interval_s", 45, (0, 15, 30, 45), "s"),
     ("warm_card_gpu_pct", 100, (0, 25, 50, 75, 100), "%"),
     ("warm_card_gpu_below_10_s", 12, (0, 4, 8, 12), "s"),
@@ -30,39 +30,37 @@ TEXT = {
         "names": ("Official Blender", "Host BVH prepacking · default", "Eager GPU upload · optional"),
         "overview": "Ten consecutive animation frames",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   Frames 624–633",
-        "metrics": ("Launch to final PNG", "Mean interval between PNGs", "Mean GPU utilization",
+        "metrics": ("Time for frames 625–633", "Mean interval between PNGs", "Mean GPU utilization",
                     "Time with GPU below 10%", "Peak dedicated VRAM", "Peak system commit"),
-        "windows": ("All ten frames", "Nine warm intervals", "Nine warm intervals",
+        "windows": ("First PNG to tenth PNG", "Nine warm intervals", "Nine warm intervals",
                     "Nine warm intervals", "Launch to process exit", "Launch to process exit"),
         "traces": "GPU and memory over time",
         "trace_labels": ("GPU utilization", "Dedicated VRAM", "Physical RAM", "System commit"),
         "time": "Seconds since launch",
         "notes": "Each column shows one complete run. Dashed lines mark publication of the first and last PNG.",
-        "projection_title": "Measured and estimated sequence time",
-        "projection_sub": "RX 7800 XT   /   Launch to final PNG   /   Time reductions relative to Official Blender at the same frame count",
-        "projection_rows": ("10 frames · measured", "1,000 frames · estimated"),
-        "projection_cols": ("Render mode", "Total time", "Time reduction"),
+        "projection_title": "Nine measured frames after the first PNG",
+        "projection_sub": "Ruins · Radeon RX 7800 XT · Elapsed time from publication of frame 624 to publication of frame 633",
+        "projection_cols": ("Render mode", "Frames 625–633", "Time reduction vs stock", "1,000 frames · estimate"),
         "reference": "Reference",
-        "projection_note": "One measured first frame + 999 intervals at the mean of the nine measured PNG intervals.",
+        "projection_note": "Only the estimate includes startup and the first PNG, followed by 999 intervals at the measured mean.",
     },
     "zh": {
         "names": ("官方 Blender", "主机端 BVH 预打包 · 默认", "提前上传显存 · 可选"),
         "overview": "连续十帧动画渲染",
         "subtitle": "Blender 5.2.1 LTS   /   Radeon RX 7800 XT   /   HIP   /   1920 × 1080   /   第 624–633 帧",
-        "metrics": ("启动至最后一张 PNG 写完", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
+        "metrics": ("第 625–633 帧出图耗时", "相邻 PNG 平均出图间隔", "GPU 平均利用率",
                     "GPU 利用率低于 10% 的时长", "专用显存峰值", "系统提交内存峰值"),
-        "windows": ("全部十帧", "后九个出图间隔", "后九个出图间隔",
+        "windows": ("首张至第十张 PNG 写完", "后九个出图间隔", "后九个出图间隔",
                     "后九个出图间隔", "从启动到进程退出", "从启动到进程退出"),
         "traces": "GPU 与内存使用时间线",
         "trace_labels": ("GPU 利用率", "专用显存", "物理内存", "系统提交内存"),
         "time": "距启动时间（秒）",
         "notes": "每列对应一组完整测试。两条虚线依次标出首张和末张 PNG 写完的时间。",
-        "projection_title": "10 帧实测与 1,000 帧估算的耗时降幅",
-        "projection_sub": "RX 7800 XT 单次启动至末张 PNG 写完，耗时降幅以同帧数的官方 Blender 耗时为分母。",
-        "projection_rows": ("10 帧 · 实测", "1,000 帧 · 估算"),
-        "projection_cols": ("渲染模式", "总耗时", "耗时降幅"),
+        "projection_title": "首帧之后连续九帧的实测耗时",
+        "projection_sub": "Ruins · Radeon RX 7800 XT · 从第 624 帧 PNG 写完计时，至第 633 帧 PNG 写完",
+        "projection_cols": ("渲染模式", "第 625–633 帧", "相对官方耗时降幅", "1,000 帧总耗时估算"),
         "reference": "基准",
-        "projection_note": "实测首帧耗时 + 999 个出图间隔，每个间隔取实测后九帧的平均值。",
+        "projection_note": "千帧估算单独计入启动与首帧，再加上 999 个按后九帧均值计算的出图间隔。",
     },
 }
 
@@ -103,14 +101,12 @@ def project_1000_frames(summary):
         rows.append(dict(run=run, measured_frames=10, measured_total_s=measured_total,
                          measured_first_png_s=first, measured_nine_intervals_s=measured_nine,
                          measured_interval_count=9, projected_frames=1000, projected_total_s=estimate))
-    baseline = rows[0]["projected_total_s"]
+    baseline = rows[0]["measured_nine_intervals_s"]
     for row in rows:
-        saved = baseline - row["projected_total_s"]
-        measured_baseline = rows[0]["measured_total_s"]
-        row["measured_reduction_vs_official_pct"] = round(
-            100 * (measured_baseline - row["measured_total_s"]) / measured_baseline, 6)
-        row.update(projected_saved_vs_official_s=saved,
-                   projected_reduction_vs_official_pct=round(100 * saved / baseline, 6))
+        saved = baseline - row["measured_nine_intervals_s"]
+        row["measured_nine_saved_vs_official_s"] = saved
+        row["measured_nine_reduction_vs_official_pct"] = round(100 * saved / baseline, 6)
+        row["projected_saved_vs_official_s"] = rows[0]["projected_total_s"] - row["projected_total_s"]
     with (HERE / "data" / "projection.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=rows[0], lineterminator="\n")
         writer.writeheader()
@@ -132,37 +128,29 @@ def projection(language, rows):
     fig.text(.04, .94, words["projection_title"], va="top", fontsize=24,
              fontweight="bold", color=INK)
     fig.text(.041, .83, words["projection_sub"], va="top", fontsize=11, color=MUTED)
-    mode_label, time_label, reduction_label = words["projection_cols"]
-    fig.text(.041, .639, mode_label, fontsize=11, fontweight="bold", color=MUTED)
+    for x, label in zip((.041, .32, .495, .75), words["projection_cols"]):
+        fig.text(x, .655, label, fontsize=12, fontweight="bold", color=MUTED)
     bottom, height = .215, .374
     row_centers = [bottom + height * (1 - (i + .5) / len(rows)) for i in range(len(rows))]
-    for name, color, y in zip(words["names"], COLORS, row_centers):
+    ax = fig.add_axes([.495, bottom, .20, height])
+    style_axis(ax)
+    ax.set_yticks([])
+    ax.set_ylim(len(rows) - .5, -.5)
+    ax.set_xlim(0, 36)
+    ax.set_xticks((0, 10, 20, 30), ("0%", "10%", "20%", "30%"))
+    ax.grid(axis="x", color=GRID, linewidth=.8)
+    for index, (run, name, color, y) in enumerate(zip(rows, words["names"], COLORS, row_centers)):
         fig.text(.041, y, name, va="center", color=color, fontsize=12.5, fontweight="bold")
-
-    groups = (("measured", .30, .423), ("projected", .642, .80))
-    for heading_text, (prefix, time_x, rate_x) in zip(words["projection_rows"], groups):
-        fig.text(time_x, .715, heading_text, color=INK, fontsize=15, fontweight="bold")
-        fig.text(time_x, .639, time_label, fontsize=11, fontweight="bold", color=MUTED)
-        fig.text(rate_x, .639, reduction_label, fontsize=11, fontweight="bold", color=MUTED)
-        ax = fig.add_axes([rate_x, bottom, .16, height])
-        style_axis(ax)
-        ax.set_yticks([])
-        ax.set_ylim(len(rows) - .5, -.5)
-        ax.set_xlim(0, 36)
-        ax.set_xticks((0, 10, 20, 30), ("0%", "10%", "20%", "30%"))
-        ax.grid(axis="x", color=GRID, linewidth=.8)
-        for index, (run, color, y) in enumerate(zip(rows, COLORS, row_centers)):
-            total = run[f"{prefix}_total_s"]
-            duration = (f"{total:.3f} {'秒' if language == 'zh' else 's'}"
-                        if prefix == "measured" else duration_label(total, language))
-            fig.text(time_x, y, duration, va="center", color=INK, fontsize=12)
-            if index == 0:
-                ax.text(1, index, words["reference"], va="center", color=MUTED, fontsize=10)
-                continue
-            rate = float(run[f"{prefix}_reduction_vs_official_pct"])
+        elapsed = f"{run['measured_nine_intervals_s']:.3f} {'秒' if language == 'zh' else 's'}"
+        fig.text(.32, y, elapsed, va="center", color=INK, fontsize=12)
+        fig.text(.75, y, duration_label(run["projected_total_s"], language), va="center", color=INK, fontsize=12)
+        if index == 0:
+            ax.text(1, index, words["reference"], va="center", color=MUTED, fontsize=10)
+        else:
+            rate = float(run["measured_nine_reduction_vs_official_pct"])
             ax.barh(index, rate, height=.35, color=color)
-            ax.text(rate - .9, index, f"{rate:.2f}%", ha="right", va="center",
-                    color="white", fontsize=10, fontweight="bold")
+            ax.text(rate - .9, index, f"{rate:.2f}%", ha="right", va="center", color="white",
+                    fontsize=10, fontweight="bold")
     fig.text(.041, .067, words["projection_note"], color=MUTED, fontsize=11)
     fig.savefig(HERE / f"projection-{language}.png", dpi=150, facecolor="white")
     plt.close(fig)
@@ -239,6 +227,8 @@ if __name__ == "__main__":
     summary_rows = {r["run"]: r for r in read_data("summary.csv")}
     timeline_rows = read_data("telemetry.csv")
     projected_rows = project_1000_frames(summary_rows)
+    for row in projected_rows:
+        summary_rows[row["run"]]["measured_nine_intervals_s"] = row["measured_nine_intervals_s"]
     for language in (("en", "zh") if args.language == "both" else (args.language,)):
         with plt.rc_context({"font.family": select_font(language), "axes.unicode_minus": False}):
             projection(language, projected_rows)

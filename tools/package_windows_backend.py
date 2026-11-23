@@ -63,12 +63,14 @@ def instructions(version, language):
     tag = f"{REPOSITORY}/tree/v{version}"
     release = f"{REPOSITORY}/releases/tag/v{version}"
     upstream = f"https://projects.blender.org/blender/blender/src/commit/{BLENDER_REVISION}"
-    commands = r"""```powershell
-.\install_backend.ps1 -PatchedExe .\blender.exe -BlenderInstall "$env:ProgramFiles\Blender Foundation\Blender 5.2" -Destination .\backend
+    commands = fr"""```powershell
+.\install_backend.ps1 -Language {language} -BlenderInstall "$env:ProgramFiles\Blender Foundation\Blender 5.2" -Destination .\backend
 ```"""
     extension = f"cycles_frame_pipeline-{version}-{language}.zip"
     if language == "zh-CN":
         return f"""# Cycles Frame Pipeline {version} · Windows x64
+
+[English](README.md) · 简体中文
 
 安装官方 Blender 5.2.1 LTS（构建 `9e2066aef7ef`），解压本包，在解压目录的 PowerShell 中运行以下命令。目标目录必须是新目录。安装器会复制本机的官方运行时和 GPU 内核，创建启用 AMD HIP、NVIDIA CUDA 和 NVIDIA OptiX 的独立 Blender。
 
@@ -87,6 +89,8 @@ def instructions(version, language):
 本包随附项目许可证 `COPYING`、官方 `copyright.txt` 以及 `license/` 中的第三方许可声明。
 """
     return f"""# Cycles Frame Pipeline {version} · Windows x64
+
+English · [简体中文](README.zh-CN.md)
 
 Install official Blender 5.2.1 LTS (build `9e2066aef7ef`). Extract this archive, open PowerShell in the extracted directory and run the command below. Choose a new destination directory. The installer copies your official runtime and GPU kernels into a separate Blender installation with AMD HIP, NVIDIA CUDA and NVIDIA OptiX enabled.
 
@@ -118,11 +122,10 @@ def main():
     parser.add_argument("patched_exe", type=Path)
     parser.add_argument("official_install", type=Path)
     parser.add_argument("output_zip", type=Path, nargs="?",
-                        help="default: dist/cycles-frame-pipeline-windows-x64-VERSION-LANGUAGE.zip")
-    parser.add_argument("--language", choices=("en", "zh-CN"), required=True)
+                        help="default: dist/cycles-frame-pipeline-windows-x64-VERSION.zip")
     args = parser.parse_args()
     version = tomllib.loads((ROOT/"extension/blender_manifest.toml").read_text("utf8"))["version"]
-    output = args.output_zip or ROOT/"dist"/f"cycles-frame-pipeline-windows-x64-{version}-{args.language}.zip"
+    output = args.output_zip or ROOT/"dist"/f"cycles-frame-pipeline-windows-x64-{version}.zip"
     official = args.official_install
     info = subprocess.check_output([official/"blender.exe", "--version"], text=True,
                                    encoding="utf8", errors="replace")
@@ -139,16 +142,17 @@ def main():
             add(archive, "blender.exe", image)
             add(archive, "install_backend.ps1", (ROOT/"tools/install_backend.ps1").read_bytes())
             templates = ROOT/"tools/windows_release"
-            add(archive, "open_blender.ps1", (templates/"open_blender.ps1").read_bytes())
+            add(archive, "windows_release/open_blender.ps1", (templates/"open_blender.ps1").read_bytes())
             # Windows PowerShell 5.1 expects a BOM for localized UTF-8 data files.
-            messages = (templates/f"{args.language}.psd1").read_text(encoding="utf-8-sig")
-            add(archive, "install-messages.psd1", messages.encode("utf-8-sig"))
+            for language, guide in (("en", "README.md"), ("zh-CN", "README.zh-CN.md")):
+                messages = (templates/f"{language}.psd1").read_text(encoding="utf-8-sig")
+                add(archive, f"windows_release/{language}.psd1", messages.encode("utf-8-sig"))
+                add(archive, guide, instructions(version, language).encode("utf-8"))
             add(archive, "COPYING", (ROOT/"COPYING").read_bytes())
             add(archive, "copyright.txt", (official/"copyright.txt").read_bytes())
             for notice in notices:
                 add(archive, notice.relative_to(official).as_posix(), notice.read_bytes())
             add(archive, "license/others/NVIDIA-OptiX.md", (ROOT/"engine/OptiX-NOTICE.md").read_bytes())
-            add(archive, "README.md", instructions(version, args.language).encode("utf-8"))
         staged.replace(output)
     print(f"{output} ({output.stat().st_size:,} bytes)")
 

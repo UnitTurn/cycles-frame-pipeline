@@ -1,4 +1,4 @@
-"""Compare stock synchronous PNGs against the native two-stage HIP pipeline on the same scene."""
+"""Compare stock and prepared PNGs on one GPU and record their publication times."""
 import argparse
 import json
 import os
@@ -6,18 +6,20 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 
 
-def make_scene(path, all_samples, prepared=False):
+def make_scene(path, all_samples, prepared=False, frames=3):
     import bpy
     from mathutils import Vector
     sys.path.insert(0, str(HERE))
     from check_render import make_base_scene
 
-    scene, _ = make_base_scene("HIP", "7800 XT", 0, True)
-    scene.frame_start, scene.frame_end = 1, 3
+    scene, _ = make_base_scene("CPU", None, 0, True)
+    scene.frame_start, scene.frame_end = 1, frames
+    middle = (frames + 1) // 2
     scene.render.resolution_x, scene.render.resolution_y = 144, 96
     scene.render.film_transparent = False
     scene.render.image_settings.color_depth = '8'
@@ -39,7 +41,7 @@ def make_scene(path, all_samples, prepared=False):
     camera.data.lens = 22
     camera.data.clip_start, camera.data.clip_end = .1, 1000
     camera.scale = (1.000000119, .99999994, 1)
-    for frame, x in [(1, -.21), (2, -.06), (3, .13)]:
+    for frame, x in [(1, -.21), (middle, -.06), (frames, .13)]:
         camera.location = (x, -3.65, 1.78)
         camera.rotation_euler = (Vector((0, 0, .72)) - camera.location).to_track_quat('-Z', 'Y').to_euler()
         camera.keyframe_insert(data_path="location", frame=frame)
@@ -90,7 +92,7 @@ def make_scene(path, all_samples, prepared=False):
     panel.shape_key_add(name='Basis')
     bend = panel.shape_key_add(name='Bend')
     bend.data[2].co.z += .35
-    for frame, value in [(1, 0.0), (2, .65), (3, .2)]:
+    for frame, value in [(1, 0.0), (middle, .65), (frames, .2)]:
         bend.value = value
         bend.keyframe_insert(data_path='value', frame=frame)
     points = [((x-6)*.21, (y-1)*.23, .33+y*.23+.02*(x%3)) for y in range(4) for x in range(13)]
@@ -118,8 +120,23 @@ def make_scene(path, all_samples, prepared=False):
     bpy.ops.wm.save_as_mainfile(filepath=str(path))
 
 
-def configure_dynamic_fallback():
+def configure_render(device, device_name, dynamic_fallback):
     import bpy
+    sys.path.insert(0, str(HERE))
+    from check_render import select_gpu
+
+    scene = bpy.context.scene
+    selected = select_gpu(scene, device, device_name)
+    print("FRAMEPIPE_TEST_DEVICE=" + json.dumps(selected), flush=True)
+    scene.cycles.samples = 256
+    scene.cycles.use_adaptive_sampling = True
+    scene.cycles.adaptive_threshold = .01
+    scene.render.use_persistent_data = True
+    for layer in scene.view_layers:
+        if layer.samples:
+            layer.samples = 256
+    if not dynamic_fallback:
+        return
     bpy.context.scene.render.use_motion_blur = False
 
     def change_denoising(scene, depsgraph):
@@ -128,52 +145,74 @@ def configure_dynamic_fallback():
     bpy.app.handlers.frame_change_post.append(change_denoising)
 
 
-def run(official, backend, output, all_samples, fixture, prepared=False, dynamic_fallback=False):
+def run(official, backend, output, all_samples, fixture, prepared=False, dynamic_fallback=False,
+        device="HIP", device_name=None, frames=3):
     import numpy as np
     from PIL import Image
     output.mkdir(parents=True, exist_ok=False)
     env = {k:v for k,v in os.environ.items() if not k.startswith('CYCLES_FRAMEPIPE_') and k!='CYCLES_BVH_LOOKAHEAD'}
+    timestamps = {}
+
     def blender(label, executable, *args):
         log = output / (label+'.log')
-        with log.open('wb') as file:
-            p = subprocess.run([str(executable), '-b', *map(str,args)], env=env, stdout=file, stderr=subprocess.STDOUT)
-        if p.returncode:
-            raise RuntimeError(f"{label} failed ({p.returncode}), see {log}")
+        png_times = []
+        started = time.perf_counter()
+        with log.open("wb") as file, subprocess.Popen(
+            [str(executable), "-b", *map(str, args)], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        ) as process:
+            for line in process.stdout:
+                if re.fullmatch(rb"PIPELINE_FRAME_DONE \d+\s*", line):
+                    png_times.append(time.perf_counter() - started)
+                file.write(line)
+            if process.wait():
+                raise RuntimeError(f"{label} failed ({process.returncode}), see {log}")
+        timestamps[label] = png_times
         return log.read_text(encoding='utf8', errors='replace')
     if fixture:
         scene = fixture.resolve(strict=True)
     else:
         scene = output / 'reflectors.blend'
         blender('create', official, '--factory-startup', '--python-exit-code', '9', '-P', __file__, '--',
-                scene, *(['--all-samples'] if all_samples else []),
+                scene, '--frames', frames, *(['--all-samples'] if all_samples else []),
                 *(['--prepared'] if prepared or dynamic_fallback else []))
     entry = HERE.parents[1] / 'pipeline/render.py'
     candidate_bvh = 'prepared' if prepared else 'next'
-    setup = []
+    expression = (f'import runpy; runpy.run_path({str(Path(__file__).resolve())!r})'
+                  f'["configure_render"]({device!r}, {device_name!r}, {dynamic_fallback!r})')
     candidate_options = ['--mode', 'native', '--bvh-input', candidate_bvh, '--fallback', 'error']
     if dynamic_fallback:
-        setup = ['--python-expr', f'import runpy; runpy.run_path({str(Path(__file__).resolve())!r})["configure_dynamic_fallback"]()']
         candidate_options = []  # Exercise the default native path and its automatic fallback.
+    sequence = list(range(1, frames + 1))
+    selections = []
     for label, exe, options in [('official', official, ['--mode', 'serial', '--bvh-input', 'off']),
                                 ('candidate', backend, candidate_options)]:
-        report = blender(label, exe, scene, '-t', 4, '--python-exit-code', 9, *setup, '-P', entry, '--',
-                         '--profile', 'ruins-hip256', '--post-threads', 4, '--output', output/label,
+        report = blender(label, exe, scene, '-t', 4, '--python-exit-code', 9, '--python-expr', expression,
+                         '-P', entry, '--', '--profile', 'scene', '--post-threads', 4, '--output', output/label,
                          *options)
+        selected, = re.findall(r'^FRAMEPIPE_TEST_DEVICE=(.+)$', report, re.MULTILINE)
+        selections.append(json.loads(selected))
+        assert selections[-1]["type"] == device, selected
+        assert [int(n) for n in re.findall(r'^PIPELINE_FRAME_DONE (\d+)$', report, re.MULTILINE)] == sequence, (output / f'{label}.log')
         if label == 'candidate':
             assert 'PIPELINE_MODE async native' in report, report
             if dynamic_fallback:
                 assert 'READYFRAME frame=1 event=sample_begin ' in report, report
                 assert 'PIPELINE_MODE serial frame 2' in report, report
-                assert re.findall(r'PIPELINE_FRAME_DONE (\d+)', report) == ['1','2','3'], report
             elif prepared:
-                for frame in range(1, 4):
-                    for stage in ('scene_eval', 'bvh_packed', 'prepared', 'sample_begin'):
+                for frame in sequence:
+                    stages = ['scene_eval', 'prepared', 'sample_begin']
+                    if device in {'HIP', 'CUDA'}:
+                        stages.append('bvh_packed')
+                        if frame > 1:
+                            stages.extend(['host_bvh_ready', 'bvh_pack_consumed'])
+                    for stage in stages:
                         assert report.count(f'READYFRAME frame={frame} event={stage} ') == 1, report
             else:
-                assert report.count('FRAMEPIPE_EXACT hit=native ') == 2, report
-        assert report.count('PIPELINE_FRAME_DONE ') == 3, report
+                assert report.count('FRAMEPIPE_EXACT hit=native ') == frames - 1, report
+    assert selections[0] == selections[1], selections
     results = {}
-    for frame in range(1, 4):
+    for frame in sequence:
         filename = f'{frame:04d}.png'
         with Image.open(output/'official'/filename) as a, Image.open(output/'candidate'/filename) as b:
             assert a.size == b.size == (144, 96) and a.mode == b.mode == 'RGBA'
@@ -181,6 +220,14 @@ def run(official, backend, output, all_samples, fixture, prepared=False, dynamic
         results[filename] = {'different_pixels':int(np.any(diff!=0,axis=2).sum()),
                              'max_channel_delta':int(diff.max()), 'mean_channel_delta':float(diff.mean())}
     output.joinpath('comparison.json').write_text(json.dumps(results,indent=2), encoding='utf8')
+    timing = {"device": selections[0], "frames": frames, "png_seconds_since_launch": {}}
+    for label in ("official", "candidate"):
+        timing["png_seconds_since_launch"][label] = [round(t, 6) for t in timestamps[label]]
+    if frames == 10:
+        official_nine = timestamps["official"][-1] - timestamps["official"][0]
+        candidate_nine = timestamps["candidate"][-1] - timestamps["candidate"][0]
+        timing["nine_frame_reduction_pct"] = round(100 * (official_nine - candidate_nine) / official_nine, 6)
+    output.joinpath('timings.json').write_text(json.dumps(timing, indent=2), encoding='utf8')
     print(json.dumps(results,indent=2))
     if any(v['different_pixels'] for v in results.values()):
         raise SystemExit(1)
@@ -188,12 +235,21 @@ def run(official, backend, output, all_samples, fixture, prepared=False, dynamic
 
 if __name__ == '__main__':
     if '--' in sys.argv:
-        make_scene(Path(sys.argv[sys.argv.index('--')+1]).resolve(), '--all-samples' in sys.argv,
-                   '--prepared' in sys.argv)
+        inside = argparse.ArgumentParser()
+        inside.add_argument('file', type=Path)
+        inside.add_argument('--frames', type=int, choices=(3, 10), default=3)
+        inside.add_argument('--all-samples', action='store_true')
+        inside.add_argument('--prepared', action='store_true')
+        opts = inside.parse_args(sys.argv[sys.argv.index('--')+1:])
+        make_scene(opts.file.resolve(), opts.all_samples, opts.prepared, opts.frames)
     else:
         p = argparse.ArgumentParser(description=__doc__)
         for name in ('official','backend','output'):
             p.add_argument(name, type=Path)
+        p.add_argument('--device', choices=('HIP', 'CUDA', 'OPTIX'), default='HIP')
+        p.add_argument('--device-name', help='GPU name substring or exact Cycles device ID')
+        p.add_argument('--frames', type=int, choices=(3, 10), default=3,
+                       help='10 also reports the measured time reduction over frames 2–10')
         source = p.add_mutually_exclusive_group()
         source.add_argument('--all-samples', action='store_true', help='stress run using the full 256-sample adaptive job')
         source.add_argument('--scene', type=Path, help='use reflectors.blend saved by an earlier run')
@@ -203,5 +259,6 @@ if __name__ == '__main__':
         mode.add_argument('--dynamic-fallback', action='store_true',
                           help='toggle denoising between frames and compare persistent World lighting and PNG order')
         opt = p.parse_args()
+        prepared = opt.prepared or (opt.device == 'OPTIX' and not opt.dynamic_fallback)
         run(opt.official.resolve(), opt.backend.resolve(), opt.output.resolve(), opt.all_samples,
-            opt.scene, opt.prepared, opt.dynamic_fallback)
+            opt.scene, prepared, opt.dynamic_fallback, opt.device, opt.device_name, opt.frames)

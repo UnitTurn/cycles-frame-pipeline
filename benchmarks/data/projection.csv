@@ -1,4 +1,4 @@
-run,measured_frames,measured_total_s,measured_first_png_s,measured_nine_intervals_s,measured_interval_count,projected_frames,projected_total_s,measured_reduction_vs_official_pct,projected_saved_vs_official_s,projected_reduction_vs_official_pct
-official_blender,10,576.072,193.164,382.908,9,1000,42695.952,0.000000,0.000,0.000000
-cycles_frame_pipeline,10,472.271,200.398,271.873,9,1000,30378.301,18.018755,12317.651,28.849693
-eager,10,476.824,216.408,260.416,9,1000,29122.584,17.228402,13573.368,31.790761
+run,measured_frames,measured_total_s,measured_first_png_s,measured_nine_intervals_s,measured_interval_count,projected_frames,projected_total_s,measured_nine_saved_vs_official_s,measured_nine_reduction_vs_official_pct,projected_saved_vs_official_s
+official_blender,10,576.072,193.164,382.908,9,1000,42695.952,0.000,0.000000,0.000
+cycles_frame_pipeline,10,472.271,200.398,271.873,9,1000,30378.301,111.035,28.997827,12317.651
+eager,10,476.824,216.408,260.416,9,1000,29122.584,122.492,31.989930,13573.368

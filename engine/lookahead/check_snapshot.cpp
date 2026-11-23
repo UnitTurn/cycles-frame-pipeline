@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-#include "frame_snapshot.h"
+#include "bvh/frame_snapshot.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -11,12 +11,16 @@ static void require(bool value, const char *message)
   }
 }
 
+#ifdef _WIN32
+int wmain(int argc, wchar_t **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
   if (argc != 2) {
     return 2;
   }
-  const std::filesystem::path path = std::filesystem::u8path(argv[1]) / "check.cfbvh";
+  const std::filesystem::path path = std::filesystem::path(argv[1]) / "check.cfbvh";
   std::vector<framepipe::SnapshotRef> original = {
       {{-2, 0, 2}, {1, 5, 3}, 4, 0, 1, 15}, {{4, 0, 1}, {5, 1, 4}, -1, 1, 0, 8}};
   require(framepipe::write_snapshot(path, original), "Could not capture");
